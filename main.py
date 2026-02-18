@@ -84,23 +84,6 @@ class DepthwiseSeparableConvModule(nn.Module):
 
 
 class SPPBottleneck(nn.Module):
-    """Spatial pyramid pooling layer used in YOLOv3-SPP.
-
-    Args:
-        in_channels (int): The input channels of this Module.
-        out_channels (int): The output channels of this Module.
-        kernel_sizes (tuple[int]): Sequential of kernel sizes of pooling
-            layers. Default: (5, 9, 13).
-        conv_cfg (dict): Config dict for convolution layer. Default: None,
-            which means using conv2d.
-        norm_cfg (dict): Config dict for normalization layer.
-            Default: dict(type='BN').
-        act_cfg (dict): Config dict for activation layer.
-            Default: dict(type='Swish').
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Default: None.
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -137,29 +120,6 @@ class SPPBottleneck(nn.Module):
 
 
 class CSPNeXtBlock(nn.Module):
-    """The basic bottleneck block used in CSPNeXt.
-
-    Args:
-        in_channels (int): The input channels of this Module.
-        out_channels (int): The output channels of this Module.
-        expansion (float): Expand ratio of the hidden channel. Defaults to 0.5.
-        add_identity (bool): Whether to add identity to the out. Only works
-            when in_channels == out_channels. Defaults to True.
-        use_depthwise (bool): Whether to use depthwise separable convolution.
-            Defaults to False.
-        kernel_size (int): The kernel size of the second convolution layer.
-            Defaults to 5.
-        conv_cfg (dict): Config dict for convolution layer. Defaults to None,
-            which means using conv2d.
-        norm_cfg (dict): Config dict for normalization layer.
-            Defaults to dict(type='BN', momentum=0.03, eps=0.001).
-        act_cfg (dict): Config dict for activation layer.
-            Defaults to dict(type='SiLU').
-        init_cfg (:obj:`ConfigDict` or dict or list[dict] or
-            list[:obj:`ConfigDict`], optional): Initialization config dict.
-            Defaults to None.
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -201,21 +161,15 @@ class CSPNeXtBlock(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """Channel attention Module.
-
-    Args:
-        channels (int): The input (and output) channels of the attention layer.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Defaults to None
-    """
-
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.global_avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Conv2d(channels, channels, 1, 1, 0, bias=True)
         self.act = nn.Hardsigmoid(inplace=True)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Float[Tensor, "batch channels height width"]
+    ) -> Float[Tensor, "batch channels height width"]:
         """Forward function for ChannelAttention."""
         out = self.global_avgpool(x)
         out = self.fc(out)
@@ -224,33 +178,6 @@ class ChannelAttention(nn.Module):
 
 
 class CSPLayer(nn.Module):
-    """Cross Stage Partial Layer.
-
-    Args:
-        in_channels (int): The input channels of the CSP layer.
-        out_channels (int): The output channels of the CSP layer.
-        expand_ratio (float): Ratio to adjust the number of channels of the
-            hidden layer. Defaults to 0.5.
-        num_blocks (int): Number of blocks. Defaults to 1.
-        add_identity (bool): Whether to add identity in blocks.
-            Defaults to True.
-        use_cspnext_block (bool): Whether to use CSPNeXt block.
-            Defaults to False.
-        use_depthwise (bool): Whether to use depthwise separable convolution in
-            blocks. Defaults to False.
-        channel_attention (bool): Whether to add channel attention in each
-            stage. Defaults to True.
-        conv_cfg (dict, optional): Config dict for convolution layer.
-            Defaults to None, which means using conv2d.
-        norm_cfg (dict): Config dict for normalization layer.
-            Defaults to dict(type='BN')
-        act_cfg (dict): Config dict for activation layer.
-            Defaults to dict(type='Swish')
-        init_cfg (:obj:`ConfigDict` or dict or list[dict] or
-            list[:obj:`ConfigDict`], optional): Initialization config dict.
-            Defaults to None.
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -259,14 +186,9 @@ class CSPLayer(nn.Module):
         num_blocks: int = 1,
         add_identity: bool = True,
         use_depthwise: bool = False,
-        use_cspnext_block: bool = False,
         channel_attention: bool = False,
     ) -> None:
         super().__init__()
-        assert use_cspnext_block is True, (
-            "Only CSPNeXt block is supported in this implementation."
-        )
-        block = CSPNeXtBlock
         mid_channels = int(out_channels * expand_ratio)
         self.channel_attention = channel_attention
         self.main_conv = ConvModule(
@@ -287,7 +209,7 @@ class CSPLayer(nn.Module):
 
         self.blocks = nn.Sequential(
             *[
-                block(
+                CSPNeXtBlock(
                     mid_channels,
                     mid_channels,
                     1.0,
@@ -315,43 +237,6 @@ class CSPLayer(nn.Module):
 
 
 class CSPNeXt(nn.Module):
-    """CSPNeXt backbone used in RTMDet.
-
-    Args:
-        arch (str): Architecture of CSPNeXt, from {P5, P6}.
-            Defaults to P5.
-        deepen_factor (float): Depth multiplier, multiply number of
-            blocks in CSP layer by this amount. Defaults to 1.0.
-        widen_factor (float): Width multiplier, multiply number of
-            channels in each layer by this amount. Defaults to 1.0.
-        out_indices (Sequence[int]): Output from which stages.
-            Defaults to (2, 3, 4).
-        frozen_stages (int): Stages to be frozen (stop grad and set eval
-            mode). -1 means not freezing any parameters. Defaults to -1.
-        use_depthwise (bool): Whether to use depthwise separable convolution.
-            Defaults to False.
-        arch_ovewrite (list): Overwrite default arch settings.
-            Defaults to None.
-        spp_kernel_sizes: (tuple[int]): Sequential of kernel sizes of SPP
-            layers. Defaults to (5, 9, 13).
-        channel_attention (bool): Whether to add channel attention in each
-            stage. Defaults to True.
-        CSPBlock_kernel_size (int): The size of CSP Block. Default: 5
-        conv_cfg (:obj:`ConfigDict` or dict, optional): Config dict for
-            convolution layer. Defaults to None.
-        norm_cfg (:obj:`ConfigDict` or dict): Dictionary to construct and
-            config norm layer. Defaults to dict(type='BN', requires_grad=True).
-        act_cfg (:obj:`ConfigDict` or dict): Config dict for activation layer.
-            Defaults to dict(type='SiLU').
-        norm_eval (bool): Whether to set norm layers to eval mode, namely,
-            freeze running stats (mean and var). Note: Effect on Batch Norm
-            and its variants only.
-        init_cfg (:obj:`ConfigDict` or dict or list[dict] or
-            list[:obj:`ConfigDict`]): Initialization config dict.
-    """
-
-    # From left to right:
-    # in_channels, out_channels, num_blocks, add_identity, use_spp
     BASE_CHANNELS = [64, 128, 256, 512, 1024]
     BASE_NUM_BLOCKS = [3, 6, 6, 3]
     BASE_ADD_IDENTITY = [True, True, True, False]
@@ -442,7 +327,6 @@ class CSPNeXt(nn.Module):
                 num_blocks=num_blocks,
                 add_identity=add_identity,
                 use_depthwise=use_depthwise,
-                use_cspnext_block=True,
                 expand_ratio=expand_ratio,
                 channel_attention=channel_attention,
             )
