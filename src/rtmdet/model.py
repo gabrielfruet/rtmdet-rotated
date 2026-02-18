@@ -332,119 +332,128 @@ class CSPNeXt(nn.Module):
 
     def forward(
         self, x: Float[Tensor, "batch_size channels height width"]
-    ) -> tuple[Tensor, ...]:
-        outs = []
-        for i, layer_name in enumerate(self.layers):
-            layer = getattr(self, layer_name)
-            x = layer(x)
-            if i in self.out_indices:
-                outs.append(x)
-        return tuple(outs)
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        # outputs = []
+        # for layer_name in self.layers:
+        #     x = getattr(self, layer_name)(x)
+        #     if layer_name in [self.layers[i] for i in self.out_indices]:
+        #         outputs.append(x)
+        # return tuple(outputs)
+        stem = self.stem(x)
+        assert isinstance(self.stage1, nn.Module)
+        assert isinstance(self.stage2, nn.Module)
+        assert isinstance(self.stage3, nn.Module)
+        assert isinstance(self.stage4, nn.Module)
+
+        stage1 = self.stage1(stem)
+        stage2 = self.stage2(stage1)
+        stage3 = self.stage3(stage2)
+        stage4 = self.stage4(stage3)
+
+        return stage2, stage3, stage4
+
+
+def are_subsequent_power_of_two(numbers: Sequence[int]) -> bool:
+    """Check if the given sequence of numbers are subsequent power of two."""
+    for i in range(1, len(numbers)):
+        if numbers[i] != 2 * numbers[i - 1]:
+            return False
+    return True
 
 
 class CSPNeXtPAFPN(nn.Module):
     def __init__(
         self,
-        in_channels: Sequence[int],
+        in_channels: tuple[int, int, int],
         out_channels: int,
         num_csp_blocks: int = 3,
         use_depthwise: bool = False,
         expand_ratio: float = 0.5,
     ) -> None:
         super().__init__()
+        if not are_subsequent_power_of_two(in_channels):
+            raise ValueError(
+                f"in_channels should be subsequent power of two, but got {in_channels}"
+            )
+
         self.in_channels = in_channels
         self.out_channels = out_channels
-
         conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+        csp_layer = partial(
+            CSPLayer,
+            num_blocks=num_csp_blocks,
+            add_identity=False,
+            use_depthwise=use_depthwise,
+            expand_ratio=expand_ratio,
+        )
+
+        c3_ch, c4_ch, c5_ch = in_channels
 
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
-        self.reduce_layers = nn.ModuleList()
-        self.top_down_blocks = nn.ModuleList()
-        for idx in range(len(in_channels) - 1, 0, -1):
-            self.reduce_layers.append(
-                ConvModule(
-                    in_channels[idx],
-                    in_channels[idx - 1],
-                    1,
-                )
-            )
-            self.top_down_blocks.append(
-                CSPLayer(
-                    in_channels[idx - 1] * 2,
-                    in_channels[idx - 1],
-                    num_blocks=num_csp_blocks,
-                    add_identity=False,
-                    use_depthwise=use_depthwise,
-                    expand_ratio=expand_ratio,
-                )
-            )
+        self.reduce_c5 = conv(c5_ch, c4_ch, 1)
+        self.topdown_c4 = nn.Sequential(
+            csp_layer(
+                in_channels=c4_ch * 2,
+                out_channels=c4_ch,
+            ),
+            conv(
+                in_channels=c4_ch,
+                out_channels=c4_ch // 2,
+                kernel_size=1,
+            ),
+        )
+        self.topdown_c3 = csp_layer(
+            in_channels=c3_ch * 2,
+            out_channels=c3_ch,
+        )
 
-        self.downsamples = nn.ModuleList()
-        self.bottom_up_blocks = nn.ModuleList()
-        for idx in range(len(in_channels) - 1):
-            self.downsamples.append(
-                conv(
-                    in_channels[idx],
-                    in_channels[idx],
-                    3,
-                    stride=2,
-                    padding=1,
-                )
-            )
-            self.bottom_up_blocks.append(
-                CSPLayer(
-                    in_channels[idx] * 2,
-                    in_channels[idx + 1],
-                    num_blocks=num_csp_blocks,
-                    add_identity=False,
-                    use_depthwise=use_depthwise,
-                    expand_ratio=expand_ratio,
-                )
-            )
+        self.p3_out_conv = conv(c3_ch, out_channels, 3, padding=1)
+        self.p4_out_conv = conv(c4_ch, out_channels, 3, padding=1)
+        self.p5_out_conv = conv(c5_ch, out_channels, 3, padding=1)
 
-        self.out_convs = nn.ModuleList()
-        for i in range(len(in_channels)):
-            self.out_convs.append(
-                conv(
-                    in_channels[i],
-                    out_channels,
-                    3,
-                    padding=1,
-                )
-            )
+        self.downsample_p3 = conv(c3_ch, c3_ch, 3, stride=2, padding=1)
+        self.bottomup_p4 = csp_layer(
+            in_channels=c4_ch,
+            out_channels=c4_ch,
+        )
+        self.downsample_p4 = conv(c4_ch, c4_ch, 3, stride=2, padding=1)
+        self.bottomup_p5 = csp_layer(
+            in_channels=c5_ch,
+            out_channels=c5_ch,
+        )
+        self.channel_cat = partial(torch.cat, dim=1)
 
-    def forward(self, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
-        assert len(inputs) == len(self.in_channels)
+    def forward(
+        self, inputs: tuple[Tensor, Tensor, Tensor]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        c3, c4, c5 = inputs
 
-        inner_outs = [inputs[-1]]
-        for idx in range(len(self.in_channels) - 1, 0, -1):
-            feat_heigh = inner_outs[0]
-            feat_low = inputs[idx - 1]
-            feat_heigh = self.reduce_layers[len(self.in_channels) - 1 - idx](feat_heigh)
-            inner_outs[0] = feat_heigh
+        p5_reduced = self.reduce_c5(c5)
+        c4_input = self.channel_cat(
+            [self.upsample(p5_reduced), c4],
+        )
+        p4_topdown = self.topdown_c4(c4_input)
+        c3_input = self.channel_cat(
+            [self.upsample(p4_topdown), c3],
+        )
+        p3_topdown = self.topdown_c3(c3_input)
 
-            upsample_feat = self.upsample(feat_heigh)
+        p3_downsampled = self.downsample_p3(p3_topdown)
+        p4_input = self.channel_cat(
+            [p3_downsampled, p4_topdown],
+        )
+        p4_bottom_up = self.bottomup_p4(p4_input)
+        p4_downsample = self.downsample_p4(p4_bottom_up)
+        p5_input = self.channel_cat(
+            [p4_downsample, p5_reduced],
+        )
+        p5_bottom_up = self.bottomup_p5(p5_input)
 
-            inner_out = self.top_down_blocks[len(self.in_channels) - 1 - idx](
-                torch.cat([upsample_feat, feat_low], 1)
-            )
-            inner_outs.insert(0, inner_out)
+        p3 = self.p3_out_conv(p3_topdown)
+        p4 = self.p4_out_conv(p4_bottom_up)
+        p5 = self.p5_out_conv(p5_bottom_up)
 
-        outs = [inner_outs[0]]
-        for idx in range(len(self.in_channels) - 1):
-            feat_low = outs[-1]
-            feat_height = inner_outs[idx + 1]
-            downsample_feat = self.downsamples[idx](feat_low)
-            out = self.bottom_up_blocks[idx](
-                torch.cat([downsample_feat, feat_height], 1)
-            )
-            outs.append(out)
-
-        # out convs
-        for idx, conv in enumerate(self.out_convs):
-            outs[idx] = conv(outs[idx])
-
-        return tuple(outs)
+        return p3, p4, p5
 
 
 CSPNeXtTiny = partial(

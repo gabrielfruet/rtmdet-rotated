@@ -1,2 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Egg files
+*.egg
+*.egg-info/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Editors
+.vscode/
+.idea/
+
+# Logs and misc
+*.log
+.DS_Store
+
+# Environment files
+.env
 mm*
-.venv
