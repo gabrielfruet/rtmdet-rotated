@@ -1,0 +1,41 @@
+services:
+  mmdetection:
+    container_name: mmdetection-rtmdet
+    build:
+      context: ./mmdetection/docker
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/workspace/
+    working_dir: /workspace/
+    # # Keep container running by default so it's available for interactive use
+    # command: ["/bin/sh", "-c", "tail -f /dev/null"]
+    # restart: unless-stopped
+    tty: true
+    stdin_open: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu] 
+  mmrotate:
+    container_name: mmrotate-rtmdet
+    build:
+      context: ./mmrotate/docker
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/workspace/
+    working_dir: /workspace/
+    # # Keep container running by default so it's available for interactive use
+    # command: ["/bin/sh", "-c", "tail -f /dev/null"]
+    # restart: unless-stopped
+    tty: true
+    stdin_open: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu] 

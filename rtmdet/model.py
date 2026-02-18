@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Sequence
 
 import torch
@@ -6,7 +7,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-def init_weights(m):
+def init_weights(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -33,7 +34,7 @@ class ConvModule(nn.Module):
         groups: int = 1,
         momentum: float = 0.03,
         eps: float = 0.001,
-    ):
+    ) -> None:
         super().__init__()
         self.conv = nn.Conv2d(
             in_channels,
@@ -63,7 +64,7 @@ class DepthwiseSeparableConvModule(nn.Module):
         kernel_size: int,
         stride: int = 1,
         padding: int = 0,
-    ):
+    ) -> None:
         super().__init__()
         self.depthwise_conv = ConvModule(
             in_channels,
@@ -89,7 +90,7 @@ class SPPBottleneck(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_sizes: tuple[int, ...] = (5, 9, 13),
-    ):
+    ) -> None:
         super().__init__()
 
         mid_channels = in_channels // 2
@@ -112,7 +113,7 @@ class SPPBottleneck(nn.Module):
             1,
         )
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         x = self.conv1(x)
         x = torch.cat([x] + [pooling(x) for pooling in self.poolings], dim=1)
         x = self.conv2(x)
@@ -246,22 +247,17 @@ class CSPNeXt(nn.Module):
 
     def __init__(
         self,
-        arch: str = "P5",
         deepen_factor: float = 1.0,
         widen_factor: float = 1.0,
         out_indices: Sequence[int] = (2, 3, 4),
-        frozen_stages: int = -1,
         use_depthwise: bool = False,
         expand_ratio: float = 0.5,
         spp_kernel_sizes: tuple[int, ...] = (5, 9, 13),
         channel_attention: bool = True,
-        norm_eval: bool = False,
     ) -> None:
         super().__init__()
         self.out_indices = out_indices
-        self.frozen_stages = frozen_stages
         self.use_depthwise = use_depthwise
-        self.norm_eval = norm_eval
         self.widen_channels = [int(c * widen_factor) for c in self.BASE_CHANNELS]
         conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
         self.stem = nn.Sequential(
@@ -346,6 +342,119 @@ class CSPNeXt(nn.Module):
         return tuple(outs)
 
 
+class CSPNeXtPAFPN(nn.Module):
+    def __init__(
+        self,
+        in_channels: Sequence[int],
+        out_channels: int,
+        num_csp_blocks: int = 3,
+        use_depthwise: bool = False,
+        expand_ratio: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.reduce_layers = nn.ModuleList()
+        self.top_down_blocks = nn.ModuleList()
+        for idx in range(len(in_channels) - 1, 0, -1):
+            self.reduce_layers.append(
+                ConvModule(
+                    in_channels[idx],
+                    in_channels[idx - 1],
+                    1,
+                )
+            )
+            self.top_down_blocks.append(
+                CSPLayer(
+                    in_channels[idx - 1] * 2,
+                    in_channels[idx - 1],
+                    num_blocks=num_csp_blocks,
+                    add_identity=False,
+                    use_depthwise=use_depthwise,
+                    expand_ratio=expand_ratio,
+                )
+            )
+
+        self.downsamples = nn.ModuleList()
+        self.bottom_up_blocks = nn.ModuleList()
+        for idx in range(len(in_channels) - 1):
+            self.downsamples.append(
+                conv(
+                    in_channels[idx],
+                    in_channels[idx],
+                    3,
+                    stride=2,
+                    padding=1,
+                )
+            )
+            self.bottom_up_blocks.append(
+                CSPLayer(
+                    in_channels[idx] * 2,
+                    in_channels[idx + 1],
+                    num_blocks=num_csp_blocks,
+                    add_identity=False,
+                    use_depthwise=use_depthwise,
+                    expand_ratio=expand_ratio,
+                )
+            )
+
+        self.out_convs = nn.ModuleList()
+        for i in range(len(in_channels)):
+            self.out_convs.append(
+                conv(
+                    in_channels[i],
+                    out_channels,
+                    3,
+                    padding=1,
+                )
+            )
+
+    def forward(self, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        assert len(inputs) == len(self.in_channels)
+
+        inner_outs = [inputs[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feat_heigh = inner_outs[0]
+            feat_low = inputs[idx - 1]
+            feat_heigh = self.reduce_layers[len(self.in_channels) - 1 - idx](feat_heigh)
+            inner_outs[0] = feat_heigh
+
+            upsample_feat = self.upsample(feat_heigh)
+
+            inner_out = self.top_down_blocks[len(self.in_channels) - 1 - idx](
+                torch.cat([upsample_feat, feat_low], 1)
+            )
+            inner_outs.insert(0, inner_out)
+
+        outs = [inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            feat_low = outs[-1]
+            feat_height = inner_outs[idx + 1]
+            downsample_feat = self.downsamples[idx](feat_low)
+            out = self.bottom_up_blocks[idx](
+                torch.cat([downsample_feat, feat_height], 1)
+            )
+            outs.append(out)
+
+        # out convs
+        for idx, conv in enumerate(self.out_convs):
+            outs[idx] = conv(outs[idx])
+
+        return tuple(outs)
+
+
+CSPNeXtTiny = partial(
+    CSPNeXt,
+    deepen_factor=0.167,
+    widen_factor=0.375,
+    use_depthwise=False,
+)
+
+
 class RotatedRTMDet(nn.Module):
     def __init__(self, backbone: nn.Module):
         super().__init__()
@@ -355,24 +464,3 @@ class RotatedRTMDet(nn.Module):
         self, x: Float[Tensor, "batch_size channels height width"]
     ) -> tuple[Tensor, ...]:
         return self.backbone(x)
-
-
-if __name__ == "__main__":
-    model = RotatedRTMDet(
-        CSPNeXt(deepen_factor=0.167, widen_factor=0.375, use_depthwise=False)
-    )
-    ckpt = torch.load(
-        "./cspnext-tiny_imagenet_600e.pth",
-        map_location="cpu",
-    )
-    missing_keys, unexpected_keys = model.load_state_dict(
-        ckpt["state_dict"], strict=False
-    )
-    if missing_keys:
-        print(f"Missing keys: {missing_keys}")
-    if unexpected_keys:
-        print(f"Unexpected keys: {unexpected_keys}")
-    x = torch.randn(1, 3, 640, 640)
-    outs = model(x)
-    for out in outs:
-        print(out.shape)
