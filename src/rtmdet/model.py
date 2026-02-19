@@ -23,7 +23,7 @@ def init_weights(m: nn.Module) -> None:
         nn.init.constant_(m.bias, 0)
 
 
-class ConvModule(nn.Module):
+class ConvBNSiLU(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -66,7 +66,7 @@ class DepthwiseSeparableConvModule(nn.Module):
         padding: int = 0,
     ) -> None:
         super().__init__()
-        self.depthwise_conv = ConvModule(
+        self.depthwise_conv = ConvBNSiLU(
             in_channels,
             in_channels,
             kernel_size=kernel_size,
@@ -74,7 +74,7 @@ class DepthwiseSeparableConvModule(nn.Module):
             padding=padding,
             groups=in_channels,
         )
-        self.pointwise_conv = ConvModule(in_channels, out_channels, kernel_size=1)
+        self.pointwise_conv = ConvBNSiLU(in_channels, out_channels, kernel_size=1)
 
     def forward(
         self, x: Float[Tensor, "batch in_channels height width"]
@@ -94,7 +94,7 @@ class SPPBottleneck(nn.Module):
         super().__init__()
 
         mid_channels = in_channels // 2
-        self.conv1 = ConvModule(
+        self.conv1 = ConvBNSiLU(
             in_channels,
             mid_channels,
             1,
@@ -107,7 +107,7 @@ class SPPBottleneck(nn.Module):
             ]
         )
         conv2_channels = mid_channels * (len(kernel_sizes) + 1)
-        self.conv2 = ConvModule(
+        self.conv2 = ConvBNSiLU(
             conv2_channels,
             out_channels,
             1,
@@ -132,7 +132,7 @@ class CSPNeXtBlock(nn.Module):
     ) -> None:
         super().__init__()
         hidden_channels = int(out_channels * expansion)
-        conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+        conv = DepthwiseSeparableConvModule if use_depthwise else ConvBNSiLU
         self.conv1 = conv(
             in_channels,
             hidden_channels,
@@ -192,17 +192,17 @@ class CSPLayer(nn.Module):
         super().__init__()
         mid_channels = int(out_channels * expand_ratio)
         self.channel_attention = channel_attention
-        self.main_conv = ConvModule(
+        self.main_conv = ConvBNSiLU(
             in_channels,
             mid_channels,
             1,
         )
-        self.short_conv = ConvModule(
+        self.short_conv = ConvBNSiLU(
             in_channels,
             mid_channels,
             1,
         )
-        self.final_conv = ConvModule(
+        self.final_conv = ConvBNSiLU(
             2 * mid_channels,
             out_channels,
             1,
@@ -259,23 +259,23 @@ class CSPNeXt(nn.Module):
         self.out_indices = out_indices
         self.use_depthwise = use_depthwise
         self.widen_channels = [int(c * widen_factor) for c in self.BASE_CHANNELS]
-        conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+        conv = DepthwiseSeparableConvModule if use_depthwise else ConvBNSiLU
         self.stem = nn.Sequential(
-            ConvModule(
+            ConvBNSiLU(
                 self.IMAGE_INPUT_CHANNELS,
                 int(self.widen_channels[0] // 2),
                 3,
                 padding=1,
                 stride=2,
             ),
-            ConvModule(
+            ConvBNSiLU(
                 int(self.widen_channels[0] // 2),
                 int(self.widen_channels[0] // 2),
                 3,
                 padding=1,
                 stride=1,
             ),
-            ConvModule(
+            ConvBNSiLU(
                 int(self.widen_channels[0] // 2),
                 int(self.widen_channels[0]),
                 3,
@@ -333,12 +333,6 @@ class CSPNeXt(nn.Module):
     def forward(
         self, x: Float[Tensor, "batch_size channels height width"]
     ) -> tuple[Tensor, Tensor, Tensor]:
-        # outputs = []
-        # for layer_name in self.layers:
-        #     x = getattr(self, layer_name)(x)
-        #     if layer_name in [self.layers[i] for i in self.out_indices]:
-        #         outputs.append(x)
-        # return tuple(outputs)
         stem = self.stem(x)
         assert isinstance(self.stage1, nn.Module)
         assert isinstance(self.stage2, nn.Module)
@@ -378,7 +372,7 @@ class CSPNeXtPAFPN(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
-        conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
+        conv = DepthwiseSeparableConvModule if use_depthwise else ConvBNSiLU
         csp_layer = partial(
             CSPLayer,
             num_blocks=num_csp_blocks,
@@ -393,17 +387,17 @@ class CSPNeXtPAFPN(nn.Module):
         self.reduce_c5 = conv(c5_ch, c4_ch, 1)
         self.topdown_c4 = nn.Sequential(
             csp_layer(
-                in_channels=c4_ch * 2,
+                in_channels=c5_ch,
                 out_channels=c4_ch,
             ),
             conv(
                 in_channels=c4_ch,
-                out_channels=c4_ch // 2,
+                out_channels=c3_ch,
                 kernel_size=1,
             ),
         )
         self.topdown_c3 = csp_layer(
-            in_channels=c3_ch * 2,
+            in_channels=c5_ch,
             out_channels=c3_ch,
         )
 
@@ -462,6 +456,177 @@ CSPNeXtTiny = partial(
     widen_factor=0.375,
     use_depthwise=False,
 )
+
+
+class Scale(nn.Module):
+    def __init__(self, init_value=1.0):
+        super(Scale, self).__init__()
+        self.scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
+
+    def forward(self, x):
+        return x * self.scale
+
+
+class RotatedRTMDetHead(nn.Module):
+    def __init__(
+        self,
+        num_classes=15,
+        in_channels=256,
+        feat_channels=256,
+        stacked_convs=2,
+        angle_dim=1,  # usually 1 for raw angle (radians) or 2 for sin/cos
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # 1. Classification Tower (Shared weights across levels)
+        self.cls_convs = self._make_tower(in_channels, feat_channels, stacked_convs)
+
+        # 2. Regression Tower (Shared weights across levels)
+        self.reg_convs = self._make_tower(in_channels, feat_channels, stacked_convs)
+
+        # 3. Final Predictors
+        # Output: [B, num_classes, H, W]
+        self.rtm_cls = nn.Conv2d(feat_channels, num_classes, 1)
+
+        # Output: [B, 4, H, W] (l, t, r, b distances)
+        self.rtm_reg = nn.Conv2d(feat_channels, 4, 1)
+
+        # Output: [B, angle_dim, H, W]
+        self.rtm_ang = nn.Conv2d(feat_channels, angle_dim, 1)
+
+        # Objectness is usually shared with regression in RTMDet logic or separate
+        # Simplified: We treat objectness as implicit or add a separate 1x1 if needed.
+        # RTMDet official uses a separate objectness branch or merges it.
+        # Let's keep it simple: No explicit objectness branch for now (like FCOS).
+
+        # Learnable Scales (one per FPN level)
+        # Assuming standard 3 levels (P3, P4, P5). If variable, use nn.ModuleList
+        self.scales = nn.ModuleList([Scale(1.0) for _ in range(3)])
+
+        self._init_weights()
+
+    def _make_tower(self, in_ch, feat_ch, layers):
+        tower = []
+        for i in range(layers):
+            tower.append(
+                ConvBNSiLU(
+                    in_ch if i == 0 else feat_ch,
+                    feat_ch,
+                    kernel_size=3,
+                    padding=1,
+                )
+            )
+        return nn.Sequential(*tower)
+
+    def _init_weights(self):
+        # Basic initialization to prevent NaN at start
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, std=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Initialize classification bias to -4.59 (prevent massive background loss)
+        nn.init.constant_(self.rtm_cls.bias, -4.59)
+
+    def forward(
+        self, feats: list[Tensor]
+    ) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
+        """
+        feats: list of tensors [P3, P4, P5]
+        """
+        cls_scores = []
+        bbox_preds = []
+        angle_preds = []
+
+        for idx, x in enumerate(feats):
+            # Parallel Towers
+            cls_feat = self.cls_convs(x)
+            reg_feat = self.reg_convs(x)
+
+            # Predict
+            cls_score = self.rtm_cls(cls_feat)
+
+            # Reg branch predicts Distance(l,t,r,b) + Angle
+            # We use the scale layer here for stability
+            reg_pred = self.rtm_reg(reg_feat)
+            reg_pred = self.scales[idx](
+                reg_pred
+            ).exp()  # Exp because distances must be > 0
+
+            angle_pred = self.rtm_ang(reg_feat)  # Raw angle
+
+            cls_scores.append(cls_score)
+            bbox_preds.append(reg_pred)
+            angle_preds.append(angle_pred)
+
+        return cls_scores, bbox_preds, angle_preds
+
+
+def compute_multiple_priors(
+    image_shape: tuple[int, int],
+    strides: Sequence[int],
+) -> Float[Tensor, "total_priors 2"]:
+    """Compute priors for multiple FPN levels."""
+    return torch.cat([compute_priors(image_shape, stride) for stride in strides], dim=0)
+
+
+def get_image_shape_after_stride(
+    image_shape: tuple[int, int], stride: int
+) -> tuple[int, int]:
+    """Compute the downsampled shape for a given stride."""
+    return (image_shape[0] + stride - 1) // stride, (
+        image_shape[1] + stride - 1
+    ) // stride
+
+
+def decode_xywh_from_ltbr_and_priors(
+    priors: Float[Tensor, "num_priors 2"],
+    reg_preds: Float[Tensor, "num_priors 4"],
+) -> Float[Tensor, "num_priors 4"]:
+    """
+    Decodes into (cx, cy, w, h) format.
+    """
+    l_shift = reg_preds[:, 0]
+    t_shift = reg_preds[:, 1]
+    r_shift = reg_preds[:, 2]
+    b_shift = reg_preds[:, 3]
+
+    w = l_shift + r_shift
+    h = t_shift + b_shift
+
+    x_prior = priors[:, 0]
+    y_prior = priors[:, 1]
+
+    cx = x_prior + (r_shift - l_shift) / 2
+    cy = y_prior + (b_shift - t_shift) / 2
+
+    return torch.stack([cx, cy, w, h], dim=-1)
+
+
+def compute_priors(
+    image_shape: tuple[int, int],
+    stride: int = 1,
+) -> Float[Tensor, "num_priors 2"]:
+    """Compute priors for a single FPN level."""
+    downsampled_shape = get_image_shape_after_stride(image_shape, stride)
+    priors = get_center_grid(downsampled_shape) * stride
+    priors = priors.view(-1, 2)
+    return priors
+
+
+def get_center_grid(
+    shape: tuple[int, int],
+) -> Float[Tensor, "h w 2"]:
+    height, width = shape
+    x_shift = torch.arange(0, width) + 0.5
+    y_shift = torch.arange(0, height) + 0.5
+
+    xx_shift, yy_shift = torch.meshgrid(x_shift, y_shift, indexing="xy")
+
+    priors = torch.stack((xx_shift, yy_shift), dim=-1)
+    return priors
 
 
 class RotatedRTMDet(nn.Module):
