@@ -51,3 +51,13 @@ def test_compute_multiple_priors():
 
     assert torch.allclose(priors[: 56 * 56], separate_priors[0])
     assert torch.allclose(priors[56 * 56 :], separate_priors[1])
+
+
+def test_points_inside_oriented_boxes1():
+    from rtmdet.model import points_inside_oriented_boxes
+
+    points = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+    boxes = torch.tensor([[2.0, 2.0, 2.0, 2.0, 0.0]])
+    inside_mask = points_inside_oriented_boxes(points, boxes)
+    assert inside_mask.shape == (3,)
+    assert inside_mask.tolist() == [True, True, False]
