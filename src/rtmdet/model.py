@@ -2,7 +2,7 @@ from functools import partial
 from typing import Sequence
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -573,9 +573,43 @@ def get_image_shape_after_stride(
     ) // stride
 
 
+def points_inside_oriented_boxes(
+    point: Float[Tensor, "N 2"], box: Float[Tensor, "M 5"]
+) -> Bool[Tensor, "N M"]:
+    """
+    Check if points are inside oriented boxes.
+
+    Args:
+        point: Points to be checked,  (x,y)
+        box: Oriented boxes, with format (cx, cy, w, h, angle).
+    Returns:
+        boolean tensor of shape indicating whether each point is inside each box.
+    """
+    cxcy_gt = box[:, :2]
+    wh_gt = box[:, 2:4]
+    rot_gt = box[:, 4]
+
+    cos_r = torch.cos(-rot_gt)
+    sin_r = torch.sin(-rot_gt)
+    R = torch.stack((cos_r, -sin_r, sin_r, cos_r), dim=-1).reshape(-1, 2, 2)
+
+    #  (N, M, 2) = (N, 1, 2) - (1, M, 2)
+    shifted_points: Float[Tensor, "N M 2"] = point[:, None] - cxcy_gt[None, :, :]
+    rotated_points = torch.einsum("nmi,mij->nmj", shifted_points, R)
+
+    half_wh = wh_gt / 2
+    inside_xy = rotated_points.abs() <= half_wh[:, None, :]
+    inside = inside_xy.all(dim=-1)
+
+    return inside
+
+
 class DynamicSoftLabelAssigner(nn.Module):
-    def __init__(self, lambda_1: float = 1, lambda_2: float = 3, lambda_3: float = 1):
+    def __init__(
+        self, k: int = 13, lambda_1: float = 1, lambda_2: float = 3, lambda_3: float = 1
+    ):
         super().__init__()
+        self.k = 13
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.lambda_3 = lambda_3
@@ -586,6 +620,17 @@ class DynamicSoftLabelAssigner(nn.Module):
             + self.lambda_2 * cost_cls
             + self.lambda_3 * cost_iou
         )
+
+    def assign(
+        self,
+        pred_boxes: Float[Tensor, "num_priors 5"],
+        pred_cls: Float[Tensor, "num_priors num_classes"],
+        gt_boxes: Float[Tensor, "num_gt 5"],
+        gt_cls: Float[Tensor, "num_gt num_classes"],
+    ):
+        # This is a placeholder for the actual assignment logic.
+        # In practice, this would involve computing the cost matrix and performing dynamic k-means or similar.
+        pass
 
 
 def compute_multiple_priors(
