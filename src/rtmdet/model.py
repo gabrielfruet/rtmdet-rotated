@@ -564,14 +564,6 @@ class RotatedRTMDetHead(nn.Module):
         return cls_scores, bbox_preds, angle_preds
 
 
-def compute_multiple_priors(
-    image_shape: tuple[int, int],
-    strides: Sequence[int],
-) -> Float[Tensor, "total_priors 2"]:
-    """Compute priors for multiple FPN levels."""
-    return torch.cat([compute_priors(image_shape, stride) for stride in strides], dim=0)
-
-
 def get_image_shape_after_stride(
     image_shape: tuple[int, int], stride: int
 ) -> tuple[int, int]:
@@ -579,6 +571,29 @@ def get_image_shape_after_stride(
     return (image_shape[0] + stride - 1) // stride, (
         image_shape[1] + stride - 1
     ) // stride
+
+
+class DynamicSoftLabelAssigner(nn.Module):
+    def __init__(self, lambda_1: float = 1, lambda_2: float = 3, lambda_3: float = 1):
+        super().__init__()
+        self.lambda_1 = lambda_1
+        self.lambda_2 = lambda_2
+        self.lambda_3 = lambda_3
+
+    def compute_cost_from_cost_parts(self, cost_reg, cost_cls, cost_iou):
+        return (
+            self.lambda_1 * cost_reg
+            + self.lambda_2 * cost_cls
+            + self.lambda_3 * cost_iou
+        )
+
+
+def compute_multiple_priors(
+    image_shape: tuple[int, int],
+    strides: Sequence[int],
+) -> Float[Tensor, "total_priors 2"]:
+    """Compute priors for multiple FPN levels."""
+    return torch.cat([compute_priors(image_shape, stride) for stride in strides], dim=0)
 
 
 def decode_xywh_from_ltbr_and_priors(
