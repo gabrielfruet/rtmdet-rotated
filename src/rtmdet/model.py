@@ -3,7 +3,7 @@ from typing import Sequence
 
 import torch
 import torchvision
-from jaxtyping import Bool, Float, Long
+from jaxtyping import Bool, Float, Int
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -654,7 +654,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         center_radius: float = 2.5,
     ):
         super().__init__()
-        self.k = 13
+        self.k = k
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.lambda_3 = lambda_3
@@ -766,6 +766,31 @@ class DynamicSoftLabelAssigner(nn.Module):
         center_distances = distance_between_points(gt_centers, pred_centers)
         center_distances_normalized = center_distances / strides[None, :]
         return self.alpha ** (center_distances_normalized - self.beta)
+
+    def dynamic_k_per_gt(
+        self, pairwise_iou: Float[Tensor, "num_gt num_priors"]
+    ) -> Int[Tensor, "num_gt"]:
+        topk_ious, _ = pairwise_iou.topk(self.k, dim=1)
+        dynamic_ks = torch.clamp(topk_ious.sum(dim=1).long(), min=1)
+        return dynamic_ks
+
+    def compute_dynamic_k_mask(
+        self,
+        *,
+        pairwise_cost: Float[Tensor, "num_gt num_priors"],
+        pairwise_iou: Float[Tensor, "num_gt num_priors"],
+    ) -> Bool[Tensor, "num_gt num_priors"]:
+        dynamic_ks = self.dynamic_k_per_gt(pairwise_iou)
+        max_dynamic_k = int(dynamic_ks.max().item())
+        topk_costs, topk_indices = pairwise_cost.topk(
+            k=max_dynamic_k, dim=1, largest=False
+        )
+        mask = torch.zeros_like(pairwise_cost, dtype=torch.bool)
+        for gt_idx in range(pairwise_cost.shape[0]):
+            k = dynamic_ks[gt_idx].item()
+            dynamic_k_indices = topk_indices[gt_idx, :k]
+            mask[gt_idx, dynamic_k_indices] = True
+        return mask
 
     @torch.no_grad
     def assign(
