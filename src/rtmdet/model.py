@@ -664,14 +664,14 @@ class DynamicSoftLabelAssigner(nn.Module):
 
     def compute_cost_from_cost_parts(
         self,
-        cost_reg: Float[Tensor, "num_gt num_priors"],
+        cost_center: Float[Tensor, "num_gt num_priors"],
         cost_cls: Float[Tensor, "num_gt num_priors"],
         cost_iou: Float[Tensor, "num_gt num_priors"],
     ) -> Float[Tensor, "num_gt num_priors"]:
         return (
-            self.lambda_1 * cost_reg
+            self.lambda_1 * cost_iou
             + self.lambda_2 * cost_cls
-            + self.lambda_3 * cost_iou
+            + self.lambda_3 * cost_center
         )
 
     def geometry_constrain(
@@ -692,12 +692,13 @@ class DynamicSoftLabelAssigner(nn.Module):
 
         valid_mask = valid_radius_mask | valid_inside_mask
 
-        return valid_mask.any(dim=1)
+        return valid_mask.any(dim=0)
 
     def compute_pairwise_iou(
         self,
-        pred_boxes: Float[Tensor, "num_priors 5"],
+        *,
         gt_boxes: Float[Tensor, "num_gt 5"],
+        pred_boxes: Float[Tensor, "num_priors 5"],
     ) -> Float[Tensor, "num_gt num_priors"]:
         """
         Compute IoU between predicted boxes and ground truth boxes.
@@ -720,31 +721,40 @@ class DynamicSoftLabelAssigner(nn.Module):
 
     def compute_pairwise_cls_cost(
         self,
+        *,
         pred_cls: Float[Tensor, "num_priors num_classes"],
         gt_cls: Float[Tensor, "num_gt num_classes"],
+        pairwise_iou: Float[Tensor, "num_gt num_priors"],
     ) -> Float[Tensor, "num_gt num_priors"]:
         """
         Compute classification cost between predicted class scores and ground truth class labels.
 
         Args:
-            pred_cls: Predicted class scores (logits) of shape (num_priors, num_classes).
-            gt_cls: Ground truth class labels in one-hot format of shape (num_gt, num_classes).
+            pred_cls: Predicted class scores (logits).
+            gt_cls: Ground truth class labels in one-hot format.
+            pairwise_iou: IoU matrix to weight the classification cost based on localization quality.
 
         Returns:
             Classification cost matrix of shape (num_gt, num_priors) where each element [i, j] is the cost of assigning pred_boxes[j] to gt_boxes[i] based on their class predictions
         """
-        pred_cls_expanded: Float[Tensor, "num_priors 1 num_classes"] = pred_cls[
-            :, None, :
-        ]
-        gt_cls_expanded: Float[Tensor, "1 num_gt num_classes"] = gt_cls[None, :, :]
+        pred_cls_expanded = pred_cls[None, :, :]  # [1, num_priors, num_classes]
+        gt_cls_expanded = gt_cls[:, None, :]  # [num_gt, 1, num_classes]
+        iou_expanded = pairwise_iou[..., None]  # [num_gt, num_priors, 1]
+
+        # Create the Soft Label (Target = 1 * IoU)
+        soft_label = gt_cls_expanded * iou_expanded
+
+        # Quality Focal Loss calculation
+        scale_factor = soft_label - pred_cls_expanded.sigmoid()
         cost_cls = F.binary_cross_entropy_with_logits(
             pred_cls_expanded,
-            gt_cls_expanded,
+            soft_label,
             reduction="none",
-        ).sum(dim=-1)
-        return cost_cls
+        ) * scale_factor.abs().pow(2.0)
 
-    def compute_pairwise_reg_cost(
+        return cost_cls.sum(dim=-1)
+
+    def compute_pairwise_center_prior_cost(
         self,
         pred_boxes: Float[Tensor, "num_priors 5"],
         gt_boxes: Float[Tensor, "num_gt 5"],
@@ -770,7 +780,8 @@ class DynamicSoftLabelAssigner(nn.Module):
     def dynamic_k_per_gt(
         self, pairwise_iou: Float[Tensor, "num_gt num_priors"]
     ) -> Int[Tensor, "num_gt"]:
-        topk_ious, _ = pairwise_iou.topk(self.k, dim=1)
+        safe_k = min(self.k, pairwise_iou.shape[1])
+        topk_ious, _ = pairwise_iou.topk(safe_k, dim=1)
         dynamic_ks = torch.clamp(topk_ious.sum(dim=1).long(), min=1)
         return dynamic_ks
 
@@ -782,15 +793,48 @@ class DynamicSoftLabelAssigner(nn.Module):
     ) -> Bool[Tensor, "num_gt num_priors"]:
         dynamic_ks = self.dynamic_k_per_gt(pairwise_iou)
         max_dynamic_k = int(dynamic_ks.max().item())
+        safe_max_dynamic_k = min(max_dynamic_k, pairwise_cost.shape[1])
         topk_costs, topk_indices = pairwise_cost.topk(
-            k=max_dynamic_k, dim=1, largest=False
+            k=safe_max_dynamic_k, dim=1, largest=False
         )
         mask = torch.zeros_like(pairwise_cost, dtype=torch.bool)
         for gt_idx in range(pairwise_cost.shape[0]):
             k = dynamic_ks[gt_idx].item()
             dynamic_k_indices = topk_indices[gt_idx, :k]
             mask[gt_idx, dynamic_k_indices] = True
+
+        mask = self.handle_conflicts_in_mask(mask=mask, pairwise_cost=pairwise_cost)
         return mask
+
+    def handle_conflicts_in_mask(
+        self,
+        *,
+        mask: Bool[Tensor, "num_gt num_priors"],
+        pairwise_cost: Float[Tensor, "num_gt num_priors"],
+    ) -> Bool[Tensor, "num_gt num_priors"]:
+        # Find conflicts (multiple ground truths assigned to the same prior)
+        num_priors = mask.shape[1]
+        prior_assign_count = mask.sum(dim=0)
+        conflicts = prior_assign_count > 1
+
+        if not conflicts.any():
+            return mask
+
+        mask_dst = mask.clone()
+        # For each conflicting prior, keep the assignment with lowest cost
+        conflicting_prior_indices = torch.where(conflicts)[0]
+        for prior_idx in conflicting_prior_indices:
+            # Find all ground truths assigned to this prior
+            assigned_gts = torch.where(mask[:, prior_idx])[0]
+            # Keep the one with lowest cost
+            costs = pairwise_cost[assigned_gts, prior_idx]
+            max_cost_idx = torch.argmin(costs)
+            # Remove all other assignments to this prior
+            mask_dst[assigned_gts, prior_idx] = False
+            # Keep the assignment with lowest cost
+            mask_dst[assigned_gts[max_cost_idx], prior_idx] = True
+
+        return mask_dst
 
     @torch.no_grad
     def assign(
@@ -801,6 +845,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         gt_cls: Float[Tensor, "num_gt num_classes"],
         strides: Float[Tensor, "num_priors"],
     ):
+        num_priors = pred_boxes.shape[0]
         valid_mask = self.geometry_constrain(pred_boxes, gt_boxes)
 
         valid_pred_boxes = pred_boxes[valid_mask]
@@ -808,17 +853,47 @@ class DynamicSoftLabelAssigner(nn.Module):
         valid_strides = strides[valid_mask]
 
         pairwise_iou: Float[Tensor, "num_gt num_valid_priors"] = (
-            self.compute_pairwise_iou(pred_boxes, gt_boxes)
+            self.compute_pairwise_iou(pred_boxes=valid_pred_boxes, gt_boxes=gt_boxes)
         )
 
         pairwise_iou_cost = self.compute_pairwise_iou_cost(pairwise_iou)
-        pairwise_cls_cost = self.compute_pairwise_cls_cost(valid_pred_cls, gt_cls)
-        pairwise_reg_cost = self.compute_pairwise_reg_cost(
+        pairwise_cls_cost = self.compute_pairwise_cls_cost(
+            pred_cls=valid_pred_cls, gt_cls=gt_cls, pairwise_iou=pairwise_iou
+        )
+        pairwise_reg_cost = self.compute_pairwise_center_prior_cost(
             valid_pred_boxes, gt_boxes, valid_strides
         )
         pairwise_cost = self.compute_cost_from_cost_parts(
             pairwise_reg_cost, pairwise_cls_cost, pairwise_iou_cost
         )
+
+        dynamic_k_mask = self.compute_dynamic_k_mask(
+            pairwise_cost=pairwise_cost,
+            pairwise_iou=pairwise_iou,
+        )
+
+        assigned_gt_inds = torch.full(
+            (num_priors,), -1, dtype=torch.long, device=pred_boxes.device
+        )
+        assigned_ious = torch.zeros(
+            (num_priors,), dtype=torch.float32, device=pred_boxes.device
+        )
+
+        if dynamic_k_mask.any():
+            # Get the indices from the [num_gt, num_valid] mask
+            matched_gt_idx, matched_valid_prior_idx = torch.where(dynamic_k_mask)
+
+            # Translate valid indices back to global indices
+            global_valid_indices = torch.where(valid_mask)[0]
+            global_prior_idx = global_valid_indices[matched_valid_prior_idx]
+
+            # Fill the return tensors
+            assigned_gt_inds[global_prior_idx] = matched_gt_idx
+            assigned_ious[global_prior_idx] = pairwise_iou[
+                matched_gt_idx, matched_valid_prior_idx
+            ]
+
+        return assigned_gt_inds, assigned_ious
 
 
 def compute_multiple_priors(
