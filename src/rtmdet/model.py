@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Sequence
+from typing import Callable, NamedTuple, Sequence
 
 import torch
 import torchvision
@@ -358,6 +358,14 @@ class CSPNeXt(nn.Module):
         return stage2, stage3, stage4
 
 
+CSPNeXtTiny = partial(
+    CSPNeXt,
+    deepen_factor=0.167,
+    widen_factor=0.375,
+    use_depthwise=False,
+)
+
+
 def are_subsequent_power_of_two(numbers: Sequence[int]) -> bool:
     """Check if the given sequence of numbers are subsequent power of two."""
     for i in range(1, len(numbers)):
@@ -461,12 +469,14 @@ class CSPNeXtPAFPN(nn.Module):
         return p3, p4, p5
 
 
-CSPNeXtTiny = partial(
-    CSPNeXt,
-    deepen_factor=0.167,
-    widen_factor=0.375,
-    use_depthwise=False,
-)
+def fpn_from_backbone(backbone: CSPNeXt) -> CSPNeXtPAFPN:
+    """Utility function to create FPN neck from a given backbone."""
+    in_channels = [backbone.widen_channels[i - 1] for i in backbone.out_indices]
+    in_channels = tuple(in_channels)
+    assert len(in_channels) == 3, (
+        "This utility function assumes the backbone has 3 output stages"
+    )
+    return CSPNeXtPAFPN(in_channels=in_channels, out_channels=256)
 
 
 class Scale(nn.Module):
@@ -489,30 +499,11 @@ class RotatedRTMDetHead(nn.Module):
     ):
         super().__init__()
         self.num_classes = num_classes
-
-        # 1. Classification Tower (Shared weights across levels)
         self.cls_convs = self._make_tower(in_channels, feat_channels, stacked_convs)
-
-        # 2. Regression Tower (Shared weights across levels)
         self.reg_convs = self._make_tower(in_channels, feat_channels, stacked_convs)
-
-        # 3. Final Predictors
-        # Output: [B, num_classes, H, W]
         self.rtm_cls = nn.Conv2d(feat_channels, num_classes, 1)
-
-        # Output: [B, 4, H, W] (l, t, r, b distances)
         self.rtm_reg = nn.Conv2d(feat_channels, 4, 1)
-
-        # Output: [B, angle_dim, H, W]
         self.rtm_ang = nn.Conv2d(feat_channels, angle_dim, 1)
-
-        # Objectness is usually shared with regression in RTMDet logic or separate
-        # Simplified: We treat objectness as implicit or add a separate 1x1 if needed.
-        # RTMDet official uses a separate objectness branch or merges it.
-        # Let's keep it simple: No explicit objectness branch for now (like FCOS).
-
-        # Learnable Scales (one per FPN level)
-        # Assuming standard 3 levels (P3, P4, P5). If variable, use nn.ModuleList
         self.scales = nn.ModuleList([Scale(1.0) for _ in range(3)])
 
         self._init_weights()
@@ -584,12 +575,32 @@ def get_image_shape_after_stride(
     ) // stride
 
 
+class RotatedRTMDetOutput(NamedTuple):
+    cls_scores: list[Float[Tensor, "batch_size num_priors num_classes"]]
+    bbox_preds: list[Float[Tensor, "batch_size num_priors 4"]]
+    angle_preds: list[Float[Tensor, "batch_size num_priors angle_dim"]]
+
+
 class RotatedRTMDet(nn.Module):
-    def __init__(self, backbone: nn.Module):
+    REGISTRY: dict[str, Callable[[], CSPNeXt]] = {
+        "rtmdetr-tiny": CSPNeXtTiny,
+    }
+    backbone: CSPNeXt
+
+    def __init__(self, model_name: str):
         super().__init__()
-        self.backbone = backbone
+        self.backbone = self.REGISTRY[model_name]()
+        self.fpn = fpn_from_backbone(self.backbone)
+        self.head = RotatedRTMDetHead(in_channels=256)
 
     def forward(
         self, x: Float[Tensor, "batch_size channels height width"]
-    ) -> tuple[Tensor, ...]:
-        return self.backbone(x)
+    ) -> RotatedRTMDetOutput:
+        feats_per_stage = self.backbone(x)
+        fpn_feats_per_stage = self.fpn(feats_per_stage)
+        cls_scores, bbox_preds, angle_preds = self.head(fpn_feats_per_stage)
+        return RotatedRTMDetOutput(
+            cls_scores=cls_scores,
+            bbox_preds=bbox_preds,
+            angle_preds=angle_preds,
+        )
