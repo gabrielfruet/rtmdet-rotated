@@ -4,7 +4,7 @@ from rtmdet.model import compute_priors
 
 
 def test_get_center_grid():
-    from rtmdet.model import get_center_grid
+    from rtmdet.ops import get_center_grid
 
     image_shape = (224, 224)
     center_grid = get_center_grid(image_shape)
@@ -17,7 +17,7 @@ def test_get_center_grid():
 
 
 def test_get_image_shape_after_stride():
-    from rtmdet.model import get_image_shape_after_stride
+    from rtmdet.ops import get_image_shape_after_stride
 
     image_shape = (224, 224)
     stride = 4
@@ -26,7 +26,7 @@ def test_get_image_shape_after_stride():
 
 
 def test_compute_priors():
-    from rtmdet.model import compute_priors
+    from rtmdet.ops import compute_priors
 
     image_shape = (224, 224)
     stride = 4
@@ -41,7 +41,7 @@ def test_compute_priors():
 
 
 def test_compute_multiple_priors():
-    from rtmdet.model import compute_multiple_priors, compute_priors
+    from rtmdet.ops import compute_multiple_priors, compute_priors
 
     image_shape = (224, 224)
     strides = [4, 8]
@@ -54,7 +54,7 @@ def test_compute_multiple_priors():
 
 
 def test_points_inside_oriented_boxes1():
-    from rtmdet.model import points_inside_oriented_boxes
+    from rtmdet.ops import points_inside_oriented_boxes
 
     points = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [3.1, 3.1]])
     boxes = torch.tensor([[2.0, 2.0, 2.0, 2.0, 0.0]])
@@ -64,7 +64,7 @@ def test_points_inside_oriented_boxes1():
 
 
 def test_dynamic_soft_label_assigment_dynamic_k_per_gt():
-    from rtmdet.model import DynamicSoftLabelAssigner
+    from rtmdet.assigner import DynamicSoftLabelAssigner
 
     assigner = DynamicSoftLabelAssigner(k=2)
 
@@ -81,7 +81,7 @@ def test_dynamic_soft_label_assigment_dynamic_k_per_gt():
 
 
 def test_dynamic_soft_label_assigment_compute_dynamic_k_mask():
-    from rtmdet.model import DynamicSoftLabelAssigner
+    from rtmdet.assigner import DynamicSoftLabelAssigner
 
     assigner = DynamicSoftLabelAssigner(k=2)
 
@@ -108,3 +108,39 @@ def test_dynamic_soft_label_assigment_compute_dynamic_k_mask():
 
     assert mask.shape == (4, 3)
     assert (mask == ground_truth_mask).all()
+
+
+def test_dynamic_soft_label_assigment_handle_conflicts():
+    from rtmdet.assigner import DynamicSoftLabelAssigner
+
+    assigner = DynamicSoftLabelAssigner(k=2)
+
+    pairwise_costs = torch.Tensor(
+        [[10.0, 0.5, 0.5], [0.3, 0.4, 0.5], [0.1, 0.1, 0.1], [10.0, 10.0, 100.0]]
+    )
+
+    conflict_mask = torch.tensor(
+        [
+            [False, True, True],
+            [True, False, False],
+            [True, False, False],
+            [True, False, False],
+        ]
+    )
+
+    resolved_mask = torch.tensor(
+        [
+            [False, True, True],
+            [False, False, False],
+            [True, False, False],
+            [False, False, False],
+        ]
+    )
+
+    mask = assigner.handle_conflicts_in_mask(
+        mask=conflict_mask,
+        pairwise_cost=pairwise_costs,
+    )
+
+    assert mask.shape == (4, 3)
+    assert (mask == resolved_mask).all()
