@@ -2,9 +2,12 @@ from functools import partial
 from typing import Sequence
 
 import torch
-from jaxtyping import Bool, Float
+import torchvision
+from jaxtyping import Bool, Float, Long
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+from rtmdet.loss import batch_probiou, probiou
 
 
 def init_weights(m: nn.Module) -> None:
@@ -604,41 +607,210 @@ def points_inside_oriented_boxes(
     return inside
 
 
+def distance_between_points(
+    points_a: Float[Tensor, "N 2"], points_b: Float[Tensor, "M 2"]
+) -> Float[Tensor, "N M"]:
+    """
+    Compute the pairwise distance between two sets of points.
+
+    Args:
+        points_a: First set of points, shape (N, 2).
+        points_b: Second set of points, shape (M, 2).
+    Returns:
+        A tensor of shape (N, M) where each element [i, j] is the distance between points_a[i] and points_b[j].
+    """
+    # (N, M, 2) = (N, 1, 2) - (1, M, 2)
+    diff = points_a[:, None] - points_b[None, :, :]
+    dist_squared = (diff**2).sum(dim=-1)
+    return torch.sqrt(dist_squared)
+
+
+def within_certain_region(
+    points_a: Float[Tensor, "N 2"],
+    points_b: Float[Tensor, "M 2"],
+    radius: float,
+) -> Bool[Tensor, "N M"]:
+    """
+    Check if points_a are within a certain radius of points_b.
+
+    Args:
+        points_a: Points to be checked, shape (N, 2).
+        points_b: Reference points, shape (M, 2).
+        radius: The radius within which points_a should be to points_b.
+    Returns:
+        boolean tensor of shape (N, M) indicating whether each point in points_a is within the radius of each point in points_b.
+    """
+    distances = distance_between_points(points_a, points_b)
+    return distances <= radius
+
+
 class DynamicSoftLabelAssigner(nn.Module):
     def __init__(
-        self, k: int = 13, lambda_1: float = 1, lambda_2: float = 3, lambda_3: float = 1
+        self,
+        k: int = 13,
+        lambda_1: float = 1,
+        lambda_2: float = 3,
+        lambda_3: float = 1,
+        center_radius: float = 2.5,
     ):
         super().__init__()
         self.k = 13
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.lambda_3 = lambda_3
+        self.alpha = 10
+        self.beta = 3
+        self.center_radius = center_radius
 
-    def compute_cost_from_cost_parts(self, cost_reg, cost_cls, cost_iou):
+    def compute_cost_from_cost_parts(
+        self,
+        cost_reg: Float[Tensor, "num_gt num_priors"],
+        cost_cls: Float[Tensor, "num_gt num_priors"],
+        cost_iou: Float[Tensor, "num_gt num_priors"],
+    ) -> Float[Tensor, "num_gt num_priors"]:
         return (
             self.lambda_1 * cost_reg
             + self.lambda_2 * cost_cls
             + self.lambda_3 * cost_iou
         )
 
+    def geometry_constrain(
+        self,
+        pred_boxes: Float[Tensor, "num_priors 5"],
+        gt_boxes: Float[Tensor, "num_gt 5"],
+    ) -> Bool[Tensor, "num_priors"]:
+        valid_radius_mask = within_certain_region(
+            points_a=pred_boxes[:, :2],
+            points_b=gt_boxes[:, :2],
+            radius=self.center_radius,
+        )
+
+        valid_inside_mask = points_inside_oriented_boxes(
+            point=pred_boxes[:, :2],
+            box=gt_boxes,
+        )
+
+        valid_mask = valid_radius_mask | valid_inside_mask
+
+        return valid_mask.any(dim=1)
+
+    def compute_pairwise_iou(
+        self,
+        pred_boxes: Float[Tensor, "num_priors 5"],
+        gt_boxes: Float[Tensor, "num_gt 5"],
+    ) -> Float[Tensor, "num_gt num_priors"]:
+        """
+        Compute IoU between predicted boxes and ground truth boxes.
+
+        Args:
+            pred_boxes: Predicted boxes in (cx, cy, w, h, angle) format, shape (num_priors, 5).
+            gt_boxes: Ground truth boxes in (cx, cy, w, h, angle) format, shape (num_gt, 5).
+
+        Returns:
+            IoU matrix of shape (num_gt, num_priors) where each element [i, j] is the IoU between pred_boxes[j] and gt_boxes[i].
+        """
+        return batch_probiou(gt_boxes, pred_boxes)
+
+    def compute_pairwise_iou_cost(
+        self,
+        pairwise_iou: Float[Tensor, "num_gt num_priors"],
+        eps: float = 1e-7,
+    ) -> Float[Tensor, "num_gt num_priors"]:
+        return -torch.log(pairwise_iou + eps)
+
+    def compute_pairwise_cls_cost(
+        self,
+        pred_cls: Float[Tensor, "num_priors num_classes"],
+        gt_cls: Float[Tensor, "num_gt num_classes"],
+    ) -> Float[Tensor, "num_gt num_priors"]:
+        """
+        Compute classification cost between predicted class scores and ground truth class labels.
+
+        Args:
+            pred_cls: Predicted class scores (logits) of shape (num_priors, num_classes).
+            gt_cls: Ground truth class labels in one-hot format of shape (num_gt, num_classes).
+
+        Returns:
+            Classification cost matrix of shape (num_gt, num_priors) where each element [i, j] is the cost of assigning pred_boxes[j] to gt_boxes[i] based on their class predictions
+        """
+        pred_cls_expanded: Float[Tensor, "num_priors 1 num_classes"] = pred_cls[
+            :, None, :
+        ]
+        gt_cls_expanded: Float[Tensor, "1 num_gt num_classes"] = gt_cls[None, :, :]
+        cost_cls = F.binary_cross_entropy_with_logits(
+            pred_cls_expanded,
+            gt_cls_expanded,
+            reduction="none",
+        ).sum(dim=-1)
+        return cost_cls
+
+    def compute_pairwise_reg_cost(
+        self,
+        pred_boxes: Float[Tensor, "num_priors 5"],
+        gt_boxes: Float[Tensor, "num_gt 5"],
+        strides: Float[Tensor, "num_priors"],
+    ) -> Float[Tensor, "num_gt num_priors"]:
+        """
+        Compute regression cost between predicted boxes and ground truth boxes.
+        Args:
+            pred_boxes: Predicted boxes in (cx, cy, w, h, angle) format, shape (num_priors, 5).
+            gt_boxes: Ground truth boxes in (cx, cy, w, h, angle)
+                format, shape (num_gt, 5).
+        Returns:
+            Regression cost matrix of shape (num_gt, num_priors) where each
+            element [i, j] is the cost of assigning pred_boxes[j] to
+            gt_boxes[i] based on their box regression predictions.
+        """
+        pred_centers = pred_boxes[:, :2]
+        gt_centers = gt_boxes[:, :2]
+        center_distances = distance_between_points(gt_centers, pred_centers)
+        center_distances_normalized = center_distances / strides[None, :]
+        return self.alpha ** (center_distances_normalized - self.beta)
+
+    @torch.no_grad
     def assign(
         self,
         pred_boxes: Float[Tensor, "num_priors 5"],
         pred_cls: Float[Tensor, "num_priors num_classes"],
         gt_boxes: Float[Tensor, "num_gt 5"],
         gt_cls: Float[Tensor, "num_gt num_classes"],
+        strides: Float[Tensor, "num_priors"],
     ):
-        # This is a placeholder for the actual assignment logic.
-        # In practice, this would involve computing the cost matrix and performing dynamic k-means or similar.
-        pass
+        valid_mask = self.geometry_constrain(pred_boxes, gt_boxes)
+
+        valid_pred_boxes = pred_boxes[valid_mask]
+        valid_pred_cls = pred_cls[valid_mask]
+        valid_strides = strides[valid_mask]
+
+        pairwise_iou: Float[Tensor, "num_gt num_valid_priors"] = (
+            self.compute_pairwise_iou(pred_boxes, gt_boxes)
+        )
+
+        pairwise_iou_cost = self.compute_pairwise_iou_cost(pairwise_iou)
+        pairwise_cls_cost = self.compute_pairwise_cls_cost(valid_pred_cls, gt_cls)
+        pairwise_reg_cost = self.compute_pairwise_reg_cost(
+            valid_pred_boxes, gt_boxes, valid_strides
+        )
+        pairwise_cost = self.compute_cost_from_cost_parts(
+            pairwise_reg_cost, pairwise_cls_cost, pairwise_iou_cost
+        )
 
 
 def compute_multiple_priors(
     image_shape: tuple[int, int],
     strides: Sequence[int],
-) -> Float[Tensor, "total_priors 2"]:
+) -> tuple[Float[Tensor, "total_priors 2"], Float[Tensor, "total_priors"]]:
     """Compute priors for multiple FPN levels."""
-    return torch.cat([compute_priors(image_shape, stride) for stride in strides], dim=0)
+    priors_list = [compute_priors(image_shape, stride) for stride in strides]
+    stride_flat_tensor = torch.cat(
+        [
+            torch.full((priors.shape[0],), stride)
+            for priors, stride in zip(priors_list, strides)
+        ],
+        dim=0,
+    )
+    priors_flat_tensor = torch.cat(priors_list, dim=0)
+    return priors_flat_tensor, stride_flat_tensor
 
 
 def decode_xywh_from_ltbr_and_priors(
