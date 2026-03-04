@@ -583,7 +583,7 @@ class RotatedRTMDetOutput(NamedTuple):
 
 class RotatedRTMDet(nn.Module):
     REGISTRY: dict[str, Callable[[], CSPNeXt]] = {
-        "rtmdetr-tiny": CSPNeXtTiny,
+        "rtmdet-tiny": CSPNeXtTiny,
     }
     backbone: CSPNeXt
 
