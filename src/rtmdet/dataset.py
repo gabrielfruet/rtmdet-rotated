@@ -1,11 +1,12 @@
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
 import torch
+from torchvision import tv_tensors
 from jaxtyping import Float, Int
-from PIL import Image
+from PIL import Image as PILImage
 from torch.utils.data import Dataset
 
 NDArray4Corners = npt.NDArray[np.floating]
@@ -31,8 +32,8 @@ DOTA_DEFAULT_CLASS_NAMES = [
 
 
 class OrientedBoundingBoxSample(NamedTuple):
-    image: Float[torch.Tensor, "C H W"]
-    boxes: Float[torch.Tensor, "N 5"]  # xywhr format
+    image: Float[tv_tensors.Image, "C H W"]
+    boxes: Float[torch.Tensor, "N 5"]  # xywhr format, absolute coords
     labels: Int[torch.Tensor, "N"]
 
 
@@ -70,14 +71,57 @@ def oriented_bbox_from_corners(corners: NDArray4Corners) -> NDArrayOBBoxes:
     return np.stack([cx, cy, width, height, angle], axis=1)
 
 
+def denormalize_boxes(boxes: NDArrayOBBoxes, width: int, height: int) -> NDArrayOBBoxes:
+    """Denormalize bounding boxes from [0,1] to absolute pixel coordinates.
+
+    Args:
+        boxes: Array of shape (N, 5) with normalized (cx, cy, w, h, angle).
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Array of shape (N, 5) with absolute (cx, cy, w, h, angle).
+    """
+    boxes = boxes.copy()
+    boxes[:, 0] *= width  # cx
+    boxes[:, 2] *= width  # w
+    boxes[:, 1] *= height  # cy
+    boxes[:, 3] *= height  # h
+    return boxes
+
+
+def normalize_boxes(boxes: NDArrayOBBoxes, width: int, height: int) -> NDArrayOBBoxes:
+    """Normalize bounding boxes from absolute pixel coordinates to [0,1].
+
+    Args:
+        boxes: Array of shape (N, 5) with absolute (cx, cy, w, h, angle).
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Array of shape (N, 5) with normalized (cx, cy, w, h, angle).
+    """
+    boxes = boxes.copy()
+    boxes[:, 0] /= width  # cx
+    boxes[:, 2] /= width  # w
+    boxes[:, 1] /= height  # cy
+    boxes[:, 3] /= height  # h
+    return boxes
+
+
 class DOTADataset(Dataset[OrientedBoundingBoxSample]):
     def __init__(
-        self, root: Path, split: str = "train", class_names: list[str] | None = None
+        self,
+        root: Path,
+        split: str = "train",
+        class_names: list[str] | None = None,
+        transform: Callable | None = None,
     ):
         self.root = root
         self.split = split
         self.class_names = class_names or DOTA_DEFAULT_CLASS_NAMES
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
+        self.transform = transform
 
         # DOTA128 structure: images/{split}/ and labels/{split}/
         img_dir = root / "images" / split
@@ -99,9 +143,12 @@ class DOTADataset(Dataset[OrientedBoundingBoxSample]):
     def __getitem__(self, idx: int) -> OrientedBoundingBoxSample:
         img_path = self.image_paths[idx]
 
-        # Load image
-        img = Image.open(img_path).convert("RGB")
+        # Load image as PIL for torchvision v2 transforms compatibility
+        img = PILImage.open(img_path).convert("RGB")
         W, H = img.size
+
+        # Convert to tv_tensors.Image for v2 transforms compatibility
+        img = tv_tensors.Image(img)
 
         # Load annotations
         label_path = self.label_dir / f"{img_path.stem}.txt"
@@ -117,18 +164,25 @@ class DOTADataset(Dataset[OrientedBoundingBoxSample]):
                 labels = torch.from_numpy(data[:, 0]).long()
                 corners = data[:, 1:]  # shape (N, 8), normalized
 
-                # Convert corners to xywh
+                # Convert corners to xywhr
                 boxes_normalized = oriented_bbox_from_corners(corners)  # (N, 5)
 
-                # Denormalize: cx, w use W; cy, h use H
-                boxes_normalized[:, 0] *= W  # cx
-                boxes_normalized[:, 2] *= W  # w
-                boxes_normalized[:, 1] *= H  # cy
-                boxes_normalized[:, 3] *= H  # h
-
-                boxes = torch.from_numpy(boxes_normalized).float()
+                # Denormalize to absolute coordinates
+                boxes_absolute = denormalize_boxes(boxes_normalized, W, H)
+                boxes = torch.from_numpy(boxes_absolute).float()
         else:
             boxes = torch.empty(0, 5)
             labels = torch.empty(0, dtype=torch.long)
 
-        return OrientedBoundingBoxSample(image=image, boxes=boxes, labels=labels)
+        boxes = tv_tensors.BoundingBoxes(  # type: ignore
+            boxes,
+            format=tv_tensors.BoundingBoxFormat.CXCYWHR,
+            canvas_size=(H, W),
+        )
+
+        if self.transform:
+            img, boxes, labels = self.transform(img, boxes, labels)
+
+        sample = OrientedBoundingBoxSample(image=img, boxes=boxes, labels=labels)
+
+        return sample
