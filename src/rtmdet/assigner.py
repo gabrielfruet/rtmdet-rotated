@@ -4,9 +4,9 @@ import torch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from torch import Tensor, nn
 from torch.nn import functional as F
-from typeguard import typechecked as typechecker
+from beartype import beartype as typechecker
 
-from rtmdet.loss import batch_probiou
+from rtmdet.probiou import batch_probiou
 from rtmdet.ops import (
     distance_between_points,
     points_inside_oriented_boxes,
@@ -212,7 +212,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         pred_boxes: Float[Tensor, "num_priors 5"],
         pred_cls: Float[Tensor, "num_priors num_classes"],
         gt_boxes: Float[Tensor, "num_gt 5"],
-        gt_cls: Float[Tensor, "num_gt num_classes"],
+        gt_cls: Int[Tensor, "num_gt num_classes"],
         strides: Float[Tensor, "num_priors"],
     ):
         num_priors = pred_boxes.shape[0]

@@ -9,7 +9,7 @@ from torch.nn import functional as F
 
 from rtmdet.assigner import DynamicSoftLabelAssigner
 from rtmdet.dataset import OrientedBoundingBoxBatch
-from rtmdet.loss import batch_probiou, probiou
+from rtmdet.probiou import batch_probiou, probiou
 from rtmdet.ops import (
     compute_multiple_priors,
     compute_priors,
