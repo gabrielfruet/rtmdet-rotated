@@ -2,15 +2,17 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 import numpy as np
-import numpy.typing as npt
 import torch
 from torchvision import tv_tensors
 from jaxtyping import Float, Int
 from PIL import Image as PILImage
+import numpy.typing as npt
 from torch.utils.data import Dataset
 
-NDArray4Corners = npt.NDArray[np.floating]
-NDArrayOBBoxes = npt.NDArray[np.floating]
+NDArray4Corners = Float[npt.NDArray, "N 8"]  # (x0, y0, x1, y1, x2, y2, x3, y3) format
+NDArrayOBBoxes = Float[
+    npt.NDArray, "N 5"
+]  # (cx, cy, w, h, angle) format, normalized to [0,1]
 
 DOTA_DEFAULT_CLASS_NAMES = [
     "plane",
@@ -153,21 +155,16 @@ class DOTADataset(Dataset[OrientedBoundingBoxSample]):
         # Load annotations
         label_path = self.label_dir / f"{img_path.stem}.txt"
         if label_path.exists():
-            data = np.loadtxt(label_path)
+            data = np.loadtxt(label_path, ndmin=2)
             if data.size == 0:
                 boxes = torch.empty(0, 5)
                 labels = torch.empty(0, dtype=torch.long)
             else:
-                # Handle single bbox case (no leading dimension)
-                if data.ndim == 1:
-                    data = data[np.newaxis, :]
                 labels = torch.from_numpy(data[:, 0]).long()
                 corners = data[:, 1:]  # shape (N, 8), normalized
 
-                # Convert corners to xywhr
-                boxes_normalized = oriented_bbox_from_corners(corners)  # (N, 5)
+                boxes_normalized = oriented_bbox_from_corners(corners)
 
-                # Denormalize to absolute coordinates
                 boxes_absolute = denormalize_boxes(boxes_normalized, W, H)
                 boxes = torch.from_numpy(boxes_absolute).float()
         else:
