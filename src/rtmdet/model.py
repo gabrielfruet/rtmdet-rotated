@@ -417,7 +417,7 @@ class CSPNeXtPAFPN(nn.Module):
             ),
         )
         self.topdown_c3 = csp_layer(
-            in_channels=c5_ch,
+            in_channels=c4_ch,
             out_channels=c3_ch,
         )
 
@@ -472,7 +472,7 @@ class CSPNeXtPAFPN(nn.Module):
 
 def fpn_from_backbone(backbone: CSPNeXt) -> CSPNeXtPAFPN:
     """Utility function to create FPN neck from a given backbone."""
-    in_channels = [backbone.widen_channels[i - 1] for i in backbone.out_indices]
+    in_channels = [backbone.widen_channels[i] for i in backbone.out_indices]
     in_channels = tuple(in_channels)
     assert len(in_channels) == 3, (
         "This utility function assumes the backbone has 3 output stages"
@@ -566,10 +566,22 @@ class RotatedRTMDetHead(nn.Module):
             angle_preds.append(angle_pred)
 
         return (
-            torch.concatenate(cls_scores, dim=-2),
-            torch.concatenate(bbox_preds, dim=-2),
-            torch.concatenate(angle_preds, dim=-2),
+            _flatten_concat(cls_scores),
+            _flatten_concat(bbox_preds),
+            _flatten_concat(angle_preds),
         )
+
+
+def _flatten_concat(tensors: list[Tensor]) -> Tensor:
+    """Flatten spatial dims and concatenate along num_priors dim.
+
+    Input: list of [B, C, H, W] tensors
+    Output: [B, sum(H*W), C] tensor
+    """
+    return torch.cat(
+        [t.permute(0, 2, 3, 1).reshape(t.shape[0], -1, t.shape[1]) for t in tensors],
+        dim=1,
+    )
 
 
 def get_image_shape_after_stride(
