@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable, NamedTuple, Sequence
+from typing import Callable, NamedTuple, Sequence, cast, override
 
 import torch
 import torchvision
@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from rtmdet.assigner import DynamicSoftLabelAssigner
+from rtmdet.dataset import OrientedBoundingBoxBatch
 from rtmdet.loss import batch_probiou, probiou
 from rtmdet.ops import (
     compute_multiple_priors,
@@ -532,9 +533,10 @@ class RotatedRTMDetHead(nn.Module):
         # Initialize classification bias to -4.59 (prevent massive background loss)
         nn.init.constant_(self.rtm_cls.bias, -4.59)
 
-    def forward(
-        self, feats: list[Tensor]
-    ) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
+    def __call__(self, feats: list[Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        return cast(tuple[Tensor, Tensor, Tensor], super().__call__(feats))
+
+    def forward(self, feats: list[Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         """
         feats: list of tensors [P3, P4, P5]
         """
@@ -548,7 +550,7 @@ class RotatedRTMDetHead(nn.Module):
             reg_feat = self.reg_convs(x)
 
             # Predict
-            cls_score = self.rtm_cls(cls_feat)
+            cls_logits = self.rtm_cls(cls_feat)
 
             # Reg branch predicts Distance(l,t,r,b) + Angle
             # We use the scale layer here for stability
@@ -559,11 +561,15 @@ class RotatedRTMDetHead(nn.Module):
 
             angle_pred = self.rtm_ang(reg_feat)  # Raw angle
 
-            cls_scores.append(cls_score)
+            cls_scores.append(cls_logits)
             bbox_preds.append(reg_pred)
             angle_preds.append(angle_pred)
 
-        return cls_scores, bbox_preds, angle_preds
+        return (
+            torch.concatenate(cls_scores, dim=-2),
+            torch.concatenate(bbox_preds, dim=-2),
+            torch.concatenate(angle_preds, dim=-2),
+        )
 
 
 def get_image_shape_after_stride(
@@ -576,9 +582,9 @@ def get_image_shape_after_stride(
 
 
 class RotatedRTMDetOutput(NamedTuple):
-    cls_scores: list[Float[Tensor, "batch_size num_priors num_classes"]]
-    bbox_preds: list[Float[Tensor, "batch_size num_priors 4"]]
-    angle_preds: list[Float[Tensor, "batch_size num_priors angle_dim"]]
+    cls_logits: Float[Tensor, "batch_size num_priors num_classes"]
+    ltbr_reg: Float[Tensor, "batch_size num_priors 4"]
+    angle_preds: Float[Tensor, "batch_size num_priors angle_dim"]
 
 
 class RotatedRTMDet(nn.Module):
@@ -593,14 +599,18 @@ class RotatedRTMDet(nn.Module):
         self.fpn = fpn_from_backbone(self.backbone)
         self.head = RotatedRTMDetHead(in_channels=256)
 
+    @override
+    def __call__(self, batch: OrientedBoundingBoxBatch) -> RotatedRTMDetOutput:
+        return cast(RotatedRTMDetOutput, super().__call__(batch.images))
+
     def forward(
         self, x: Float[Tensor, "batch_size channels height width"]
     ) -> RotatedRTMDetOutput:
         feats_per_stage = self.backbone(x)
         fpn_feats_per_stage = self.fpn(feats_per_stage)
-        cls_scores, bbox_preds, angle_preds = self.head(fpn_feats_per_stage)
+        cls_logits, ltbr_reg, angle_preds = self.head(fpn_feats_per_stage)
         return RotatedRTMDetOutput(
-            cls_scores=cls_scores,
-            bbox_preds=bbox_preds,
+            cls_logits=cls_logits,
+            ltbr_reg=ltbr_reg,
             angle_preds=angle_preds,
         )

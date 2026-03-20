@@ -39,6 +39,20 @@ class OrientedBoundingBoxSample(NamedTuple):
     labels: Int[torch.Tensor, "N"]
 
 
+class OrientedBoundingBoxBatch(NamedTuple):
+    images: Float[tv_tensors.Image, "B C H W"]
+    boxes: list[Float[torch.Tensor, "N 5"]]  # xywhr format, absolute coords
+    labels: list[Int[torch.Tensor, "N"]]
+
+
+def dota_collate_fn(batch: list[OrientedBoundingBoxSample]) -> OrientedBoundingBoxBatch:
+    return OrientedBoundingBoxBatch(
+        images=tv_tensors.Image(torch.stack([sample.image for sample in batch])),
+        boxes=[sample.boxes for sample in batch],
+        labels=[sample.labels for sample in batch],
+    )
+
+
 def oriented_bbox_from_corners(corners: NDArray4Corners) -> NDArrayOBBoxes:
     """Convert 4-corner format to (cx, cy, w, h, angle) format.
 

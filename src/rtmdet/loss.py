@@ -3,6 +3,12 @@ from typing import Any
 
 import torch
 from jaxtyping import Float
+import torch.nn.functional as F
+
+from rtmdet.assigner import DynamicSoftLabelAssigner
+from rtmdet.dataset import OrientedBoundingBoxBatch
+from rtmdet.model import RotatedRTMDetOutput
+from rtmdet.ops import compute_multiple_priors, ltbr_angle_priors2xywhr
 
 
 def _get_covariance_matrix(
@@ -135,3 +141,142 @@ def batch_probiou(
     bd = (t1 + t2 + t3).clamp(eps, 100.0)
     hd = (1.0 - (-bd).exp() + eps).sqrt()
     return 1 - hd
+
+def quality_focal_loss(
+    pred: Float[torch.Tensor, "num_priors num_classes"],
+    target: Float[torch.Tensor, "num_priors num_classes"],
+    weight: Float[torch.Tensor, "num_priors"] | None = None,
+    alpha: float = 0.25,
+    beta: float = 2.0,
+    eps: float = 1e-7,
+) -> Float[torch.Tensor, ""]:
+   """Quality Focal Loss for classification.
+
+   Args:
+       pred: Predicted logits (before sigmoid)
+       target: Soft labels (one-hot * IoU weight)
+       weight: Optional per-prior weight
+       alpha: Alpha parameter
+       beta: Beta parameter
+
+   Returns:
+       Scalar loss
+   """
+   pred_sigmoid = pred.sigmoid()
+   pt = (pred_sigmoid - target).abs().pow(beta)
+   focal_weight = ((1 - target) * alpha + target * (1 - alpha)) * pt
+   bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+   loss = focal_weight * bce
+
+   if weight is not None:
+       loss = loss.sum(dim=-1) * weight
+   else:
+       loss = loss.sum(dim=-1)
+
+   return loss.mean()
+
+
+
+class RotatedTDMDetLoss(torch.nn.Module):
+    image_shape: tuple[int, int]
+    strides: list[int]
+    assigner: DynamicSoftLabelAssigner
+
+    def __init__(self, k: int = 13, eps: float = 1e-7, image_shape: tuple[int,int], strides: list[int] | None = None):
+        super().__init__()
+        self.assigner = DynamicSoftLabelAssigner(k=k)
+        self.eps = eps
+        self.strides = strides or [8, 16, 32]
+        self.image_shape = image_shape
+
+    def forward(
+        self, x: OrientedBoundingBoxBatch, y: RotatedRTMDetOutput
+    ) -> torch.Tensor:
+        """Calculate the loss for a batch of oriented bounding boxes.
+
+        Args:
+            x (OrientedBoundingBoxBatch): A batch of oriented bounding boxes, containing images, boxes, and labels.
+            y (RotatedRTMDetOutput): The output from the RotatedRTMDet model, containing predicted boxes and class scores.
+
+        Returns:
+            (torch.Tensor): The calculated loss for the batch.
+        """
+        device = x.images.device
+        batch_size = x.images.shape[0]
+        num_pos_total = 0
+
+        priors, strides = compute_multiple_priors(image_shape=self.image_shape, strides=self.strides, device=device)
+
+        for b in range(batch_size):
+            pred_boxes = ltbr_angle_priors2xywhr(y.ltbr_reg, y.angle_preds, priors)
+            num_priors = pred_boxes.shape[0]
+            pred_cls_logits = y.cls_logits
+            pred_cls = pred_cls_logits.softmax(dim=-1)
+
+            gt_boxes = x.boxes[b]
+            num_gt = gt_boxes.shape[0]
+            gt_labels = x.labels[b]
+            gt_cls = torch.empty_like(pred_cls_logits, device=device)
+            num_classes = pred_cls_logits.shape[-1]
+            gt_cls = F.one_hot(gt_labels, num_classes=num_classes)
+
+            if num_gt == 0:
+                neg_target = torch.zeros(
+                    num_priors,
+                    num_classes,
+                    device=device
+                )
+                cls_loss = quality_focal_loss(
+                    pred=y.cls_logits[b],
+                    target=neg_target,
+                    weight=None,
+                )
+
+                total_loss = total_loss + cls_loss
+                continue
+
+            assigned_labels, assigned_ious = self.assigner.assign(
+                gt_boxes=gt_boxes,
+                gt_cls=gt_cls,
+                pred_boxes=pred_boxes,
+                pred_cls=pred_cls,
+                strides=strides,
+            )
+
+            pos_mask = assigned_labels >= 0
+            num_pos = pos_mask.sum().item()
+
+            gt_cls_full = torch.zeros(
+                    num_priors, num_classes, device=device
+                    )
+
+            gt_cls_full[assigned_labels[pos_mask]] = gt_cls[assigned_labels[pos_mask]]
+            cls_weight = torch.ones_like(assigned_ious)
+            cls_weight[~pos_mask] = 0.1
+
+            cls_loss = quality_focal_loss(
+                pred=pred_cls,
+                target=gt_cls_full,
+                weight=cls_weight,
+            )
+
+            if num_pos > 0:
+                pos_idx = pos_mask.nonzero().squeeze(-1)
+
+                matched_gt_idx = assigned_labels[pos_idx]
+                pos_gt_boxes = gt_boxes[matched_gt_idx]
+                pos_pred_boxes = pred_boxes[pos_idx]
+
+                pos_ious = probiou(pos_pred_boxes, pos_gt_boxes, CIoU=True)
+                bbox_loss = (1-pos_ious).mean()
+
+                total_loss += cls_loss + bbox_loss
+
+                num_pos_total += num_pos
+            else:
+                total_loss = total_loss + cls_loss
+
+        return total_loss
+
+
+

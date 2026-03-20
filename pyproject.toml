@@ -8,6 +8,7 @@ dependencies = [
     "beartype>=0.22.9",
     "jaxtyping>=0.3.9",
     "torch>=2.10.0",
+    "typeguard>=4.5.1",
 ]
 
 [project.optional-dependencies]

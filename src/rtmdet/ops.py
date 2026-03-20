@@ -87,18 +87,44 @@ def within_certain_region(
 def compute_multiple_priors(
     image_shape: tuple[int, int],
     strides: Sequence[int],
+    device: torch.device,
 ) -> tuple[Float[Tensor, "total_priors 2"], Float[Tensor, "total_priors"]]:
     """Compute priors for multiple FPN levels."""
     priors_list = [compute_priors(image_shape, stride) for stride in strides]
     stride_flat_tensor = torch.cat(
         [
-            torch.full((priors.shape[0],), stride)
+            torch.full((priors.shape[0],), stride, device=device)
             for priors, stride in zip(priors_list, strides)
         ],
         dim=0,
     )
-    priors_flat_tensor = torch.cat(priors_list, dim=0)
+    priors_flat_tensor = torch.cat(priors_list, dim=0, device=device)
     return priors_flat_tensor, stride_flat_tensor
+
+
+def ltbr_angle_priors2xywhr(
+    ltbr: Float[Tensor, "num_priors 4"],
+    angle: Float[Tensor, "num_priors"],
+    priors: Float[Tensor, "num_priors 2"],
+) -> Float[Tensor, "num_priors 5"]:
+    """
+    Convert from (l, t, r, b) + angle to (cx, cy, w, h, angle).
+    """
+    l = ltbr[:, 0]
+    t = ltbr[:, 1]
+    r = ltbr[:, 2]
+    b = ltbr[:, 3]
+
+    w = l + r
+    h = t + b
+
+    cx = r - w / 2
+    cy = b - h / 2
+
+    px = priors[:, 0]
+    py = priors[:, 1]
+
+    return torch.stack([cx + px, cy + py, w, h, angle], dim=-1)
 
 
 def decode_xywh_from_ltbr_and_priors(
@@ -126,22 +152,22 @@ def decode_xywh_from_ltbr_and_priors(
 
 
 def compute_priors(
-    image_shape: tuple[int, int],
-    stride: int = 1,
+    image_shape: tuple[int, int], stride: int, device: torch.device
 ) -> Float[Tensor, "num_priors 2"]:
     """Compute priors for a single FPN level."""
     downsampled_shape = get_image_shape_after_stride(image_shape, stride)
-    priors = get_center_grid(downsampled_shape) * stride
+    priors = get_center_grid(downsampled_shape, device=device) * stride
     priors = priors.view(-1, 2)
     return priors
 
 
 def get_center_grid(
     shape: tuple[int, int],
+    device: torch.device,
 ) -> Float[Tensor, "h w 2"]:
     height, width = shape
-    x_shift = torch.arange(0, width) + 0.5
-    y_shift = torch.arange(0, height) + 0.5
+    x_shift = torch.arange(0, width, device=device) + 0.5
+    y_shift = torch.arange(0, height, device=device) + 0.5
 
     xx_shift, yy_shift = torch.meshgrid(x_shift, y_shift, indexing="xy")
 
