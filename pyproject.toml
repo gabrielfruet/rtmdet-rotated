@@ -21,6 +21,7 @@ test = [
 dev = [
     "basedpyright>=1.38.3",
     "fire>=0.7.1",
+    "pdbpp>=0.12.1",
 ]
 test = [
     "pytest>=9.0.2",

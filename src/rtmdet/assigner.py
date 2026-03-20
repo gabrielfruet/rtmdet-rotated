@@ -64,6 +64,7 @@ class DynamicSoftLabelAssigner(nn.Module):
 
         return valid_mask.any(dim=0)
 
+    @typechecker
     def compute_pairwise_iou(
         self,
         *,
@@ -82,6 +83,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         """
         return batch_probiou(gt_boxes, pred_boxes)
 
+    @typechecker
     def compute_pairwise_iou_cost(
         self,
         pairwise_iou: Float[Tensor, "num_gt num_priors"],
@@ -89,6 +91,7 @@ class DynamicSoftLabelAssigner(nn.Module):
     ) -> Float[Tensor, "num_gt num_priors"]:
         return -torch.log(pairwise_iou + eps)
 
+    @typechecker
     def compute_pairwise_cls_cost(
         self,
         *,
@@ -107,8 +110,8 @@ class DynamicSoftLabelAssigner(nn.Module):
         Returns:
             Classification cost matrix of shape (num_gt, num_priors) where each element [i, j] is the cost of assigning pred_boxes[j] to gt_boxes[i] based on their class predictions
         """
-        pred_cls_expanded = pred_cls[None, :, :]  # [1, num_priors, num_classes]
         gt_cls_expanded = gt_cls[:, None, :]  # [num_gt, 1, num_classes]
+        pred_cls_expanded = pred_cls[None, :, :]  # [1, num_priors, num_classes]
         iou_expanded = pairwise_iou[..., None]  # [num_gt, num_priors, 1]
 
         # Create the Soft Label (Target = 1 * IoU)
@@ -116,6 +119,8 @@ class DynamicSoftLabelAssigner(nn.Module):
 
         # Quality Focal Loss calculation
         scale_factor = soft_label - pred_cls_expanded.sigmoid()
+
+        pred_cls_expanded = pred_cls_expanded.expand_as(soft_label)
         cost_cls = F.binary_cross_entropy_with_logits(
             pred_cls_expanded,
             soft_label,
