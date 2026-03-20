@@ -73,6 +73,38 @@ def oriented_bbox_from_corners(corners: NDArray4Corners) -> NDArrayOBBoxes:
     return np.stack([cx, cy, width, height, angle], axis=1)
 
 
+def load_labels(
+    label_path: Path, width: int, height: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load labels from a DOTA format label file.
+
+    Args:
+        label_path: Path to the label file.
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Tuple of (boxes, labels) where boxes is (N, 5) tensor in CXCYWHR format
+        and labels is (N,) tensor of class indices.
+    """
+    if not label_path.exists():
+        return torch.empty(0, 5), torch.empty(0, dtype=torch.long)
+
+    data = np.loadtxt(label_path, ndmin=2)
+    if data.size == 0:
+        return torch.empty(0, 5), torch.empty(0, dtype=torch.long)
+
+    labels = torch.from_numpy(data[:, 0]).long()
+    corners = data[:, 1:]  # shape (N, 8), normalized
+
+    boxes_normalized = oriented_bbox_from_corners(corners)
+
+    boxes_absolute = denormalize_boxes(boxes_normalized, width, height)
+    boxes = torch.from_numpy(boxes_absolute).float()
+
+    return boxes, labels
+
+
 def denormalize_boxes(boxes: NDArrayOBBoxes, width: int, height: int) -> NDArrayOBBoxes:
     """Denormalize bounding boxes from [0,1] to absolute pixel coordinates.
 
@@ -154,22 +186,7 @@ class DOTADataset(Dataset[OrientedBoundingBoxSample]):
 
         # Load annotations
         label_path = self.label_dir / f"{img_path.stem}.txt"
-        if label_path.exists():
-            data = np.loadtxt(label_path, ndmin=2)
-            if data.size == 0:
-                boxes = torch.empty(0, 5)
-                labels = torch.empty(0, dtype=torch.long)
-            else:
-                labels = torch.from_numpy(data[:, 0]).long()
-                corners = data[:, 1:]  # shape (N, 8), normalized
-
-                boxes_normalized = oriented_bbox_from_corners(corners)
-
-                boxes_absolute = denormalize_boxes(boxes_normalized, W, H)
-                boxes = torch.from_numpy(boxes_absolute).float()
-        else:
-            boxes = torch.empty(0, 5)
-            labels = torch.empty(0, dtype=torch.long)
+        boxes, labels = load_labels(label_path, W, H)
 
         boxes = tv_tensors.BoundingBoxes(  # type: ignore
             boxes,
