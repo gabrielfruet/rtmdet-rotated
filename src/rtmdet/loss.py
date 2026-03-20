@@ -186,4 +186,4 @@ class RotatedRTMDetLoss(torch.nn.Module):
     def __call__(
         self, target: OrientedBoundingBoxBatch, pred: RotatedRTMDetOutput
     ) -> torch.Tensor:
-        return super.__call__(target, pred)
+        return super().__call__(target, pred)

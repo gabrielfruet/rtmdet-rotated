@@ -90,7 +90,9 @@ def compute_multiple_priors(
     device: torch.device,
 ) -> tuple[Float[Tensor, "total_priors 2"], Float[Tensor, "total_priors"]]:
     """Compute priors for multiple FPN levels."""
-    priors_list = [compute_priors(image_shape, stride) for stride in strides]
+    priors_list = [
+        compute_priors(image_shape, stride, device=device) for stride in strides
+    ]
     stride_flat_tensor = torch.cat(
         [
             torch.full((priors.shape[0],), stride, device=device)
@@ -98,7 +100,7 @@ def compute_multiple_priors(
         ],
         dim=0,
     )
-    priors_flat_tensor = torch.cat(priors_list, dim=0, device=device)
+    priors_flat_tensor = torch.cat(priors_list, dim=0)
     return priors_flat_tensor, stride_flat_tensor
 
 
