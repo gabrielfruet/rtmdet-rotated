@@ -2,7 +2,7 @@ import math
 from typing import Any
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Float, Int
 import torch.nn.functional as F
 
 from rtmdet.assigner import DynamicSoftLabelAssigner
@@ -142,6 +142,7 @@ def batch_probiou(
     hd = (1.0 - (-bd).exp() + eps).sqrt()
     return 1 - hd
 
+
 def quality_focal_loss(
     pred: Float[torch.Tensor, "num_priors num_classes"],
     target: Float[torch.Tensor, "num_priors num_classes"],
@@ -150,31 +151,30 @@ def quality_focal_loss(
     beta: float = 2.0,
     eps: float = 1e-7,
 ) -> Float[torch.Tensor, ""]:
-   """Quality Focal Loss for classification.
+    """Quality Focal Loss for classification.
 
-   Args:
-       pred: Predicted logits (before sigmoid)
-       target: Soft labels (one-hot * IoU weight)
-       weight: Optional per-prior weight
-       alpha: Alpha parameter
-       beta: Beta parameter
+    Args:
+        pred: Predicted logits (before sigmoid)
+        target: Soft labels (one-hot * IoU weight)
+        weight: Optional per-prior weight
+        alpha: Alpha parameter
+        beta: Beta parameter
 
-   Returns:
-       Scalar loss
-   """
-   pred_sigmoid = pred.sigmoid()
-   pt = (pred_sigmoid - target).abs().pow(beta)
-   focal_weight = ((1 - target) * alpha + target * (1 - alpha)) * pt
-   bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
-   loss = focal_weight * bce
+    Returns:
+        Scalar loss
+    """
+    pred_sigmoid = pred.sigmoid()
+    pt = (pred_sigmoid - target).abs().pow(beta)
+    focal_weight = ((1 - target) * alpha + target * (1 - alpha)) * pt
+    bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+    loss = focal_weight * bce
 
-   if weight is not None:
-       loss = loss.sum(dim=-1) * weight
-   else:
-       loss = loss.sum(dim=-1)
+    if weight is not None:
+        loss = loss.sum(dim=-1) * weight
+    else:
+        loss = loss.sum(dim=-1)
 
-   return loss.mean()
-
+    return loss.mean()
 
 
 class RotatedTDMDetLoss(torch.nn.Module):
@@ -182,12 +182,96 @@ class RotatedTDMDetLoss(torch.nn.Module):
     strides: list[int]
     assigner: DynamicSoftLabelAssigner
 
-    def __init__(self, k: int = 13, eps: float = 1e-7, image_shape: tuple[int,int], strides: list[int] | None = None):
+    def __init__(
+        self,
+        image_shape: tuple[int, int],
+        k: int = 13,
+        eps: float = 1e-7,
+        strides: list[int] | None = None,
+    ):
         super().__init__()
         self.assigner = DynamicSoftLabelAssigner(k=k)
         self.eps = eps
         self.strides = strides or [8, 16, 32]
         self.image_shape = image_shape
+
+    def forward_pass_single(
+        self,
+        gt_boxes: Float[torch.Tensor, "N 5"],
+        gt_labels: Int[torch.Tensor, "N"],
+        pred_boxes: Float[torch.Tensor, "num_priors 5"],
+        pred_cls_logits: Float[torch.Tensor, "num_priors num_classes"],
+        priors: Float[torch.Tensor, "num_priors 4"],
+        strides: torch.Tensor,
+        device: torch.device,
+        num_classes: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Process loss computation for a single image.
+
+        Args:
+            gt_boxes: Ground truth boxes, shape (N, 5) xywhr format.
+            gt_labels: Ground truth labels, shape (N,).
+            pred_boxes: Predicted boxes for all priors, shape (num_priors, 5).
+            pred_cls_logits: Predicted class logits, shape (num_priors, num_classes).
+            priors: Anchor priors.
+            strides: Feature strides.
+            device: Device for tensor creation.
+            num_classes: Number of classes.
+
+        Returns:
+            Tuple of (loss, num_positive_samples).
+        """
+        num_priors = pred_boxes.shape[0]
+
+        gt_cls = F.one_hot(gt_labels, num_classes=num_classes)
+
+        num_gt = gt_boxes.shape[0]
+
+        if num_gt == 0:
+            neg_target = torch.zeros(num_priors, num_classes, device=device)
+            cls_loss = quality_focal_loss(
+                pred=pred_cls_logits,
+                target=neg_target,
+                weight=None,
+            )
+            return cls_loss, 0
+
+        pred_cls = pred_cls_logits.softmax(dim=-1)
+        assigned_labels, assigned_ious = self.assigner.assign(
+            gt_boxes=gt_boxes,
+            gt_cls=gt_cls,
+            pred_boxes=pred_boxes,
+            pred_cls=pred_cls,
+            strides=strides,
+        )
+
+        pos_mask = assigned_labels >= 0
+        num_pos = pos_mask.sum().item()
+
+        gt_cls_full = torch.zeros(num_priors, num_classes, device=device)
+        gt_cls_full[assigned_labels[pos_mask]] = gt_cls[assigned_labels[pos_mask]]
+
+        cls_weight = torch.ones_like(assigned_ious)
+        cls_weight[~pos_mask] = 0.1
+
+        cls_loss = quality_focal_loss(
+            pred=pred_cls_logits,
+            target=gt_cls_full,
+            weight=cls_weight,
+        )
+
+        if num_pos > 0:
+            pos_idx = pos_mask.nonzero().squeeze(-1)
+            matched_gt_idx = assigned_labels[pos_idx]
+            pos_gt_boxes = gt_boxes[matched_gt_idx]
+            pos_pred_boxes = pred_boxes[pos_idx]
+
+            pos_ious = probiou(pos_pred_boxes, pos_gt_boxes, CIoU=True)
+            bbox_loss = (1 - pos_ious).mean()
+
+            return cls_loss + bbox_loss, num_pos
+
+        return cls_loss, 0
 
     def forward(
         self, x: OrientedBoundingBoxBatch, y: RotatedRTMDetOutput
@@ -203,80 +287,28 @@ class RotatedTDMDetLoss(torch.nn.Module):
         """
         device = x.images.device
         batch_size = x.images.shape[0]
-        num_pos_total = 0
 
-        priors, strides = compute_multiple_priors(image_shape=self.image_shape, strides=self.strides, device=device)
+        priors, strides = compute_multiple_priors(
+            image_shape=self.image_shape, strides=self.strides, device=device
+        )
+
+        pred_boxes = ltbr_angle_priors2xywhr(y.ltbr_reg, y.angle_preds, priors)
+        pred_cls_logits = y.cls_logits
+        num_classes = pred_cls_logits.shape[-1]
+
+        total_loss = torch.tensor(0.0, device=device)
 
         for b in range(batch_size):
-            pred_boxes = ltbr_angle_priors2xywhr(y.ltbr_reg, y.angle_preds, priors)
-            num_priors = pred_boxes.shape[0]
-            pred_cls_logits = y.cls_logits
-            pred_cls = pred_cls_logits.softmax(dim=-1)
-
-            gt_boxes = x.boxes[b]
-            num_gt = gt_boxes.shape[0]
-            gt_labels = x.labels[b]
-            gt_cls = torch.empty_like(pred_cls_logits, device=device)
-            num_classes = pred_cls_logits.shape[-1]
-            gt_cls = F.one_hot(gt_labels, num_classes=num_classes)
-
-            if num_gt == 0:
-                neg_target = torch.zeros(
-                    num_priors,
-                    num_classes,
-                    device=device
-                )
-                cls_loss = quality_focal_loss(
-                    pred=y.cls_logits[b],
-                    target=neg_target,
-                    weight=None,
-                )
-
-                total_loss = total_loss + cls_loss
-                continue
-
-            assigned_labels, assigned_ious = self.assigner.assign(
-                gt_boxes=gt_boxes,
-                gt_cls=gt_cls,
+            loss_b, _ = self.forward_pass_single(
+                gt_boxes=x.boxes[b],
+                gt_labels=x.labels[b],
                 pred_boxes=pred_boxes,
-                pred_cls=pred_cls,
+                pred_cls_logits=pred_cls_logits,
+                priors=priors,
                 strides=strides,
+                device=device,
+                num_classes=num_classes,
             )
-
-            pos_mask = assigned_labels >= 0
-            num_pos = pos_mask.sum().item()
-
-            gt_cls_full = torch.zeros(
-                    num_priors, num_classes, device=device
-                    )
-
-            gt_cls_full[assigned_labels[pos_mask]] = gt_cls[assigned_labels[pos_mask]]
-            cls_weight = torch.ones_like(assigned_ious)
-            cls_weight[~pos_mask] = 0.1
-
-            cls_loss = quality_focal_loss(
-                pred=pred_cls,
-                target=gt_cls_full,
-                weight=cls_weight,
-            )
-
-            if num_pos > 0:
-                pos_idx = pos_mask.nonzero().squeeze(-1)
-
-                matched_gt_idx = assigned_labels[pos_idx]
-                pos_gt_boxes = gt_boxes[matched_gt_idx]
-                pos_pred_boxes = pred_boxes[pos_idx]
-
-                pos_ious = probiou(pos_pred_boxes, pos_gt_boxes, CIoU=True)
-                bbox_loss = (1-pos_ious).mean()
-
-                total_loss += cls_loss + bbox_loss
-
-                num_pos_total += num_pos
-            else:
-                total_loss = total_loss + cls_loss
+            total_loss = total_loss + loss_b
 
         return total_loss
-
-
-
