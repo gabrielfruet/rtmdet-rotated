@@ -46,7 +46,7 @@ def quality_focal_loss(
     return loss.mean()
 
 
-class RotatedTDMDetLoss(torch.nn.Module):
+class RotatedRTMDetLoss(torch.nn.Module):
     image_shape: tuple[int, int]
     strides: list[int]
     assigner: DynamicSoftLabelAssigner
@@ -145,34 +145,34 @@ class RotatedTDMDetLoss(torch.nn.Module):
         return cls_loss, 0
 
     def forward(
-        self, x: OrientedBoundingBoxBatch, y: RotatedRTMDetOutput
+        self, target: OrientedBoundingBoxBatch, pred: RotatedRTMDetOutput
     ) -> torch.Tensor:
         """Calculate the loss for a batch of oriented bounding boxes.
 
         Args:
-            x (OrientedBoundingBoxBatch): A batch of oriented bounding boxes, containing images, boxes, and labels.
-            y (RotatedRTMDetOutput): The output from the RotatedRTMDet model, containing predicted boxes and class scores.
+            target (OrientedBoundingBoxBatch): A batch of oriented bounding boxes, containing images, boxes, and labels.
+            pred (RotatedRTMDetOutput): The output from the RotatedRTMDet model, containing predicted boxes and class scores.
 
         Returns:
             (torch.Tensor): The calculated loss for the batch.
         """
-        device = x.images.device
-        batch_size = x.images.shape[0]
+        device = target.images.device
+        batch_size = target.images.shape[0]
 
         priors, strides = compute_multiple_priors(
             image_shape=self.image_shape, strides=self.strides, device=device
         )
 
-        pred_boxes = ltbr_angle_priors2xywhr(y.ltbr_reg, y.angle_preds, priors)
-        pred_cls_logits = y.cls_logits
+        pred_boxes = ltbr_angle_priors2xywhr(pred.ltbr_reg, pred.angle_preds, priors)
+        pred_cls_logits = pred.cls_logits
         num_classes = pred_cls_logits.shape[-1]
 
         total_loss = torch.tensor(0.0, device=device)
 
         for b in range(batch_size):
             loss_b, _ = self.forward_pass_single(
-                gt_boxes=x.boxes[b],
-                gt_labels=x.labels[b],
+                gt_boxes=target.boxes[b],
+                gt_labels=target.labels[b],
                 pred_boxes=pred_boxes,
                 pred_cls_logits=pred_cls_logits,
                 strides=strides,
@@ -182,3 +182,8 @@ class RotatedTDMDetLoss(torch.nn.Module):
             total_loss = total_loss + loss_b
 
         return total_loss
+
+    def __call__(
+        self, target: OrientedBoundingBoxBatch, pred: RotatedRTMDetOutput
+    ) -> torch.Tensor:
+        return super.__call__(target, pred)
