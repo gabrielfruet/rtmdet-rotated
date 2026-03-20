@@ -7,7 +7,11 @@ from rtmdet.dataset import OrientedBoundingBoxBatch
 from rtmdet.model import RotatedRTMDetOutput
 from rtmdet.ops import compute_multiple_priors, ltbr_angle_priors2xywhr
 
+from rtmdet.probiou import probiou
+from rtmdet.typecheck import typechecker
 
+
+@typechecker
 def quality_focal_loss(
     pred: Float[torch.Tensor, "num_priors num_classes"],
     target: Float[torch.Tensor, "num_priors num_classes"],
@@ -111,8 +115,12 @@ class RotatedTDMDetLoss(torch.nn.Module):
         pos_mask = assigned_labels >= 0
         num_pos = pos_mask.sum().item()
 
-        gt_cls_full = torch.zeros(num_priors, num_classes, device=device)
-        gt_cls_full[assigned_labels[pos_mask]] = gt_cls[assigned_labels[pos_mask]]
+        gt_cls_full = torch.zeros(
+            num_priors, num_classes, device=device, dtype=torch.float32
+        )
+        gt_cls_full[assigned_labels[pos_mask]] = (
+            gt_cls[assigned_labels[pos_mask]] * assigned_ious
+        )
 
         cls_weight = torch.ones_like(assigned_ious)
         cls_weight[~pos_mask] = 0.1

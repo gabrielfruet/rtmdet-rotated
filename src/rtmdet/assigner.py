@@ -1,10 +1,9 @@
 """Assignment strategy for object detection."""
 
 import torch
-from jaxtyping import Bool, Float, Int, jaxtyped
+from jaxtyping import Bool, Float, Int
 from torch import Tensor, nn
 from torch.nn import functional as F
-from beartype import beartype as typechecker
 
 from rtmdet.probiou import batch_probiou
 from rtmdet.ops import (
@@ -12,6 +11,7 @@ from rtmdet.ops import (
     points_inside_oriented_boxes,
     within_certain_region,
 )
+from rtmdet.typecheck import typechecker
 
 
 class DynamicSoftLabelAssigner(nn.Module):
@@ -206,7 +206,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         return mask_dst
 
     @torch.no_grad
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def assign(
         self,
         pred_boxes: Float[Tensor, "num_priors 5"],
