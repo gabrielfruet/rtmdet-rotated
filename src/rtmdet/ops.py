@@ -6,6 +6,8 @@ import torch
 from jaxtyping import Bool, Float
 from torch import Tensor
 
+from rtmdet.typecheck import typechecker
+
 
 def get_image_shape_after_stride(
     image_shape: tuple[int, int], stride: int
@@ -41,12 +43,13 @@ def points_inside_oriented_boxes(
     rotated_points = torch.einsum("nmi,mij->nmj", shifted_points, R)
 
     half_wh = wh_gt / 2
-    inside_xy = rotated_points.abs() <= half_wh[:, None, :]
+    inside_xy = rotated_points.abs() <= half_wh[None, :, :]
     inside = inside_xy.all(dim=-1)
 
     return inside
 
 
+@typechecker
 def distance_between_points(
     points_a: Float[Tensor, "N 2"], points_b: Float[Tensor, "M 2"]
 ) -> Float[Tensor, "N M"]:
@@ -105,17 +108,17 @@ def compute_multiple_priors(
 
 
 def ltbr_angle_priors2xywhr(
-    ltbr: Float[Tensor, "num_priors 4"],
-    angle: Float[Tensor, "num_priors"],
+    ltbr: Float[Tensor, "*batch num_priors 4"],
+    angle: Float[Tensor, "*batch num_priors"],
     priors: Float[Tensor, "num_priors 2"],
 ) -> Float[Tensor, "num_priors 5"]:
     """
     Convert from (l, t, r, b) + angle to (cx, cy, w, h, angle).
     """
-    l = ltbr[:, 0]
-    t = ltbr[:, 1]
-    r = ltbr[:, 2]
-    b = ltbr[:, 3]
+    l = ltbr[..., 0]
+    t = ltbr[..., 1]
+    r = ltbr[..., 2]
+    b = ltbr[..., 3]
 
     w = l + r
     h = t + b
@@ -126,7 +129,7 @@ def ltbr_angle_priors2xywhr(
     px = priors[:, 0]
     py = priors[:, 1]
 
-    return torch.stack([cx + px, cy + py, w, h, angle], dim=-1)
+    return torch.stack([cx + px, cy + py, w, h, angle.squeeze()], dim=-1)
 
 
 def decode_xywh_from_ltbr_and_priors(
