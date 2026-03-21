@@ -3,6 +3,5 @@ from beartype import beartype as beartype_typechecker
 from functools import wraps
 
 
-@wraps
 def typechecker(fn):
     return jaxtyped(typechecker=beartype_typechecker)(fn)
