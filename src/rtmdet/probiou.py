@@ -77,7 +77,9 @@ def probiou(
         ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
         / (
             4
-            * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt()
+            * (
+                (a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0) + eps
+            ).sqrt()
             + eps
         )
         + eps
