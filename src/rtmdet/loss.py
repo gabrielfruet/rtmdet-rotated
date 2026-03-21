@@ -119,7 +119,8 @@ class RotatedRTMDetLoss(torch.nn.Module):
             num_priors, num_classes, device=device, dtype=torch.float32
         )
         gt_cls_full[assigned_labels[pos_mask]] = (
-            gt_cls[assigned_labels[pos_mask]] * assigned_ious
+            gt_cls[assigned_labels[pos_mask]]
+            * assigned_ious[assigned_labels[pos_mask], None]
         )
 
         cls_weight = torch.ones_like(assigned_ious)
@@ -137,7 +138,7 @@ class RotatedRTMDetLoss(torch.nn.Module):
             pos_gt_boxes = gt_boxes[matched_gt_idx]
             pos_pred_boxes = pred_boxes[pos_idx]
 
-            pos_ious = probiou(pos_pred_boxes, pos_gt_boxes, CIoU=True)
+            pos_ious = probiou(pos_pred_boxes, pos_gt_boxes, CIoU=False)
             bbox_loss = (1 - pos_ious).mean()
 
             return cls_loss + bbox_loss, int(num_pos)
@@ -173,8 +174,8 @@ class RotatedRTMDetLoss(torch.nn.Module):
             loss_b, _ = self.forward_pass_single(
                 gt_boxes=target.boxes[b],
                 gt_labels=target.labels[b],
-                pred_boxes=pred_boxes,
-                pred_cls_logits=pred_cls_logits,
+                pred_boxes=pred_boxes[b],
+                pred_cls_logits=pred_cls_logits[b],
                 strides=strides,
                 device=device,
                 num_classes=num_classes,

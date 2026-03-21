@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pathlib import Path
 from typing import Callable, NamedTuple
 
@@ -40,9 +41,16 @@ class OrientedBoundingBoxSample(NamedTuple):
 
 
 class OrientedBoundingBoxBatch(NamedTuple):
-    images: Float[tv_tensors.Image, "B C H W"]
+    images: Float[torch.Tensor, "B C H W"]
     boxes: list[Float[torch.Tensor, "N 5"]]  # xywhr format, absolute coords
     labels: list[Int[torch.Tensor, "N"]]
+
+    def to_device(self, device: torch.device) -> OrientedBoundingBoxBatch:
+        return OrientedBoundingBoxBatch(
+            images=tv_tensors.Image(self.images.to(device)),
+            boxes=[box.to(device) for box in self.boxes],
+            labels=[lbl.to(device) for lbl in self.labels],
+        )
 
 
 def dota_collate_fn(batch: list[OrientedBoundingBoxSample]) -> OrientedBoundingBoxBatch:

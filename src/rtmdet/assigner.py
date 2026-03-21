@@ -44,6 +44,7 @@ class DynamicSoftLabelAssigner(nn.Module):
             + self.lambda_3 * cost_center
         )
 
+    @typechecker
     def geometry_constrain(
         self,
         pred_boxes: Float[Tensor, "num_priors 5"],
@@ -62,7 +63,7 @@ class DynamicSoftLabelAssigner(nn.Module):
 
         valid_mask = valid_radius_mask | valid_inside_mask
 
-        return valid_mask.any(dim=0)
+        return valid_mask.any(dim=1)
 
     @typechecker
     def compute_pairwise_iou(
@@ -96,7 +97,7 @@ class DynamicSoftLabelAssigner(nn.Module):
         self,
         *,
         pred_cls: Float[Tensor, "num_priors num_classes"],
-        gt_cls: Float[Tensor, "num_gt num_classes"],
+        gt_cls: Int[Tensor, "num_gt num_classes"],
         pairwise_iou: Float[Tensor, "num_gt num_priors"],
     ) -> Float[Tensor, "num_gt num_priors"]:
         """
@@ -218,10 +219,10 @@ class DynamicSoftLabelAssigner(nn.Module):
         pred_cls: Float[Tensor, "num_priors num_classes"],
         gt_boxes: Float[Tensor, "num_gt 5"],
         gt_cls: Int[Tensor, "num_gt num_classes"],
-        strides: Float[Tensor, "num_priors"],
+        strides: Int[Tensor, "num_priors"],
     ):
         num_priors = pred_boxes.shape[0]
-        valid_mask = self.geometry_constrain(pred_boxes, gt_boxes)
+        valid_mask = self.geometry_constrain(pred_boxes=pred_boxes, gt_boxes=gt_boxes)
 
         valid_pred_boxes = pred_boxes[valid_mask]
         valid_pred_cls = pred_cls[valid_mask]
